@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Forward a native Antigravity lifecycle hook to Agent Monitor.
+
+Antigravity invokes this command with the hook event as argv[1], passes a JSON
+payload on stdin, and requires a JSON object on stdout. Monitor failures are
+deliberately non-fatal so this observer can never block an agent run.
+"""
+
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+
+DAEMON_URL = os.environ.get(
+    "AGENT_MONITOR_URL",
+    "http://127.0.0.1:8765",
+).rstrip("/")
+APPROVAL_TIMEOUT = float(
+    os.environ.get("AGENT_MONITOR_APPROVAL_TIMEOUT", "300")
+)
+POLL_INTERVAL = 0.25
+HARDWARE_OFFLINE = "hardware_offline"
+
+
+def post_event(event: str, payload: dict) -> bool:
+    request_body = {
+        "agent": "antigravity",
+        "display_name": "Antigravity",
+        "event": event,
+        "payload": payload,
+    }
+    request = urllib.request.Request(
+        f"{DAEMON_URL}/api/v1/event",
+        data=json.dumps(request_body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=0.5):
+            return True
+    except Exception:
+        # A status display must never affect Antigravity's execution.
+        return False
+
+
+def fetch_hardware_action(action_url: str):
+    try:
+        with urllib.request.urlopen(action_url, timeout=0.5) as response:
+            body = json.load(response)
+        return (body.get("data") or {}).get("action_id")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            return HARDWARE_OFFLINE
+        if exc.code != 404:
+            raise
+    return None
+
+
+def wait_for_hardware_action(request_id: str):
+    encoded_request_id = urllib.parse.quote(request_id, safe="")
+    action_url = (
+        f"{DAEMON_URL}/api/v1/action"
+        f"?request_id={encoded_request_id}&consume=true"
+    )
+    deadline = time.monotonic() + APPROVAL_TIMEOUT
+    while time.monotonic() < deadline:
+        try:
+            action_id = fetch_hardware_action(action_url)
+            if action_id == HARDWARE_OFFLINE:
+                return None
+            if action_id:
+                return action_id
+        except Exception:
+            return None
+        time.sleep(POLL_INTERVAL)
+
+    try:
+        action_id = fetch_hardware_action(action_url)
+        return None if action_id == HARDWARE_OFFLINE else action_id
+    except Exception:
+        return None
+
+
+def permission_decision(action_id):
+    if action_id == "allow_once":
+        return {
+            "decision": "allow",
+            "reason": "Approved on Agent Monitor hardware.",
+        }
+    if action_id == "reject":
+        return {
+            "decision": "deny",
+            "reason": "Rejected on Agent Monitor hardware.",
+        }
+    # Return, timeout, daemon failure, or offline hardware falls back to the
+    # native Antigravity permission prompt.
+    return {"decision": "ask"}
+
+
+def main() -> None:
+    event = sys.argv[1] if len(sys.argv) > 1 else "update"
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError):
+        payload = {}
+
+    normalized_event = event.lower().replace("_", "").replace("-", "")
+    if normalized_event == "pretooluse":
+        request_id = str(
+            payload.get("requestId")
+            or payload.get("request_id")
+            or uuid.uuid4()
+        )
+        payload["requestId"] = request_id
+        # Antigravity's hook response supports one-shot allow/deny. It does
+        # not expose a persistent Always Allow decision for a hardware hook.
+        payload["actions"] = [
+            {"id": "reject", "label": "Reject"},
+            {"id": "allow_once", "label": "Allow Once"},
+        ]
+        if post_event(event, payload):
+            result = permission_decision(
+                wait_for_hardware_action(request_id)
+            )
+        else:
+            result = permission_decision(None)
+    elif normalized_event == "stop":
+        post_event(event, payload)
+        result = {"decision": "stop"}
+    else:
+        post_event(event, payload)
+        result = {}
+    json.dump(result, sys.stdout)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

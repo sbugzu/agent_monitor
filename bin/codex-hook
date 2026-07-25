@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Forward one Codex lifecycle hook payload to the local Agent Monitor Host."""
+
+import json
+import os
+import sys
+import time
+import urllib.request
+import urllib.error
+import urllib.parse
+
+
+HOST_URL = os.environ.get(
+    "AGENT_MONITOR_URL",
+    "http://127.0.0.1:8765",
+).rstrip("/")
+APPROVAL_TIMEOUT = float(
+    os.environ.get("AGENT_MONITOR_APPROVAL_TIMEOUT", "300")
+)
+POLL_INTERVAL = 0.25
+HARDWARE_OFFLINE = "hardware_offline"
+
+
+def post_event(payload: dict) -> bool:
+    request = urllib.request.Request(
+        f"{HOST_URL}/api/v1/hooks/codex",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=0.5):
+            return True
+    except Exception:
+        # Monitoring must never alter or block a Codex turn.
+        return False
+
+
+def fetch_hardware_action(action_url: str):
+    try:
+        with urllib.request.urlopen(action_url, timeout=0.5) as response:
+            body = json.load(response)
+        return (body.get("data") or {}).get("action_id")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            return HARDWARE_OFFLINE
+        if exc.code != 404:
+            raise
+    return None
+
+
+def wait_for_hardware_action(request_id: str):
+    encoded_request_id = urllib.parse.quote(request_id, safe="")
+    action_url = (
+        f"{HOST_URL}/api/v1/action"
+        f"?request_id={encoded_request_id}&consume=true"
+    )
+    deadline = time.monotonic() + APPROVAL_TIMEOUT
+    while time.monotonic() < deadline:
+        try:
+            action_id = fetch_hardware_action(action_url)
+            if action_id == HARDWARE_OFFLINE:
+                return None
+            if action_id:
+                return action_id
+        except Exception:
+            return None
+        time.sleep(POLL_INTERVAL)
+
+    # Close the boundary race where a hardware choice arrives after the final
+    # pending response but just as the monotonic deadline is crossed.
+    try:
+        action_id = fetch_hardware_action(action_url)
+        return None if action_id == HARDWARE_OFFLINE else action_id
+    except Exception:
+        return None
+
+
+def permission_decision(action_id: str):
+    if action_id == "allow_once":
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {"behavior": "allow"},
+            }
+        }
+    if action_id == "reject":
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {
+                    "behavior": "deny",
+                    "message": "Rejected on Agent Monitor hardware.",
+                },
+            }
+        }
+    # Return or timeout: emit no decision so Codex uses its normal prompt.
+    return None
+
+
+def main() -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError):
+        payload = {}
+
+    event = str(payload.get("hook_event_name") or "").lower()
+    if event == "permissionrequest":
+        # Codex currently supports allow/deny for PermissionRequest hooks, but
+        # not a persistent Always Allow decision.
+        payload["actions"] = [
+            {"id": "reject", "label": "Reject"},
+            {"id": "allow_once", "label": "Allow Once"},
+        ]
+
+    if not post_event(payload) or event != "permissionrequest":
+        return
+
+    request_id = str(
+        payload.get("tool_use_id")
+        or payload.get("turn_id")
+        or ""
+    )
+    if not request_id:
+        return
+
+    decision = permission_decision(wait_for_hardware_action(request_id))
+    if decision:
+        json.dump(decision, sys.stdout)
+        sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

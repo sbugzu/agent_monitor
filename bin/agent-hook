@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""
+CLI Helper for sending AI Agent status events to Agent Monitor daemon.
+Usage:
+  agent-hook thinking --agent claude_code --message "Refactoring code..."
+  agent-hook wait --agent claude_code --message "Waiting for approval"
+  agent-hook done --agent claude_code --message "Task complete"
+  agent-hook error --agent claude_code --message "Failed"
+  agent-hook ack --agent claude_code
+  agent-hook exec --agent cli_task -- python test.py
+"""
+
+import sys
+import os
+import json
+import urllib.request
+import urllib.error
+import subprocess
+import argparse
+
+DAEMON_URL = os.environ.get("AGENT_MONITOR_URL", "http://127.0.0.1:8765")
+
+def send_request(endpoint: str, data: dict):
+    url = f"{DAEMON_URL}{endpoint}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(data).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            res_data = json.loads(resp.read().decode("utf-8"))
+            return res_data
+    except Exception as e:
+        # Fail gracefully if daemon is not running
+        print(f"[agent-hook] Warning: Could not reach daemon at {DAEMON_URL}: {e}", file=sys.stderr)
+        return None
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "exec":
+        # Exec wrapper mode: agent-hook exec --agent my_cli [--display "My CLI"] -- command args...
+        parser = argparse.ArgumentParser(description="Wrap command execution and send status")
+        parser.add_argument("--agent", type=str, default="cli_agent")
+        parser.add_argument("--display", type=str, default=None)
+        parser.add_argument("cmd", nargs=argparse.REMAINDER)
+        args = parser.parse_args(sys.argv[2:])
+
+        cmd_list = [c for c in args.cmd if c != "--"]
+        if not cmd_list:
+            print("Error: No command specified for exec", file=sys.stderr)
+            sys.exit(1)
+
+        cmd_str = " ".join(cmd_list)
+        agent_id = args.agent
+        display_name = args.display or agent_id.capitalize()
+
+        # 1. Send START / THINKING
+        send_request("/api/v1/event", {
+            "agent": agent_id,
+            "display_name": display_name,
+            "event": "start",
+            "cmd": cmd_str
+        })
+
+        # 2. Run Command
+        ret = subprocess.run(cmd_list)
+
+        # 3. Send EXIT status
+        send_request("/api/v1/event", {
+            "agent": agent_id,
+            "display_name": display_name,
+            "event": "exit",
+            "cmd": cmd_str,
+            "exit_code": ret.returncode
+        })
+        sys.exit(ret.returncode)
+
+    # Standard mode
+    parser = argparse.ArgumentParser(description="AI Agent Hardware Hook CLI")
+    parser.add_argument("status", choices=["thinking", "wait", "done", "error", "ack", "next", "prev"], help="Agent status event")
+    parser.add_argument("--agent", "-a", type=str, default="claude_code", help="Agent identifier")
+    parser.add_argument("--message", "-m", type=str, default="", help="Status summary message")
+    parser.add_argument("--display", "-d", type=str, default=None, help="Display name for agent")
+
+    args = parser.parse_args()
+
+    if args.status in ("next", "prev"):
+        send_request(f"/api/v1/{args.status}", {})
+    elif args.status == "ack":
+        send_request("/api/v1/ack", {"agent": args.agent})
+    else:
+        event_map = {
+            "thinking": "thinking",
+            "wait": "ask",
+            "done": "done",
+            "error": "error"
+        }
+        event_name = event_map.get(args.status, args.status)
+        send_request("/api/v1/event", {
+            "agent": args.agent,
+            "display_name": args.display,
+            "event": event_name,
+            "message": args.message
+        })
+
+if __name__ == "__main__":
+    main()

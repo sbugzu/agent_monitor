@@ -1,0 +1,53 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test and coverage output
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# Python build and packaging output
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# PlatformIO local state and build output
+/.platformio/
+/firmware/.pio/
+
+# Temporary research and generated intermediate files
+/temp/
+/hooks_parsed.txt
+
+# Runtime files
+*.log
+*.pid
+*.sock
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editor and OS metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""Manage Agent Monitor hooks for supported AI agent clients.
+
+Examples:
+  install-agent-hooks                         # install all supported agents
+  install-agent-hooks claude codex            # install selected agents
+  install-agent-hooks --check antigravity
+  install-agent-hooks --uninstall codex
+  install-agent-hooks --list
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import sys
+import tempfile
+from typing import Iterable
+
+
+SUPPORTED = ("claude", "codex", "antigravity")
+CLAUDE_EVENTS = (
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUseFailure",
+    "StopFailure",
+    "Stop",
+)
+CODEX_EVENTS = (
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "Stop",
+)
+CLAUDE_URL = "http://127.0.0.1:8765/api/v1/hooks/claude"
+
+
+def source_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def claude_dir() -> Path:
+    override = os.environ.get("AGENT_MONITOR_CLAUDE_CONFIG_DIR")
+    return Path(override).expanduser() if override else Path.home() / ".claude"
+
+
+def codex_dir() -> Path:
+    override = os.environ.get("CODEX_HOME")
+    return Path(override).expanduser() if override else Path.home() / ".codex"
+
+
+def antigravity_dir() -> Path:
+    override = os.environ.get("AGENT_MONITOR_ANTIGRAVITY_CONFIG_DIR")
+    return (
+        Path(override).expanduser()
+        if override
+        else Path.home() / ".gemini" / "config"
+    )
+
+
+def load_json(path: Path, default: dict) -> dict:
+    if not path.exists():
+        return default
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cannot safely read {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{path} must contain a JSON object")
+    return data
+
+
+def write_json(path: Path, data: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        current = load_json(path, {})
+        if current == data:
+            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+            return
+        shutil.copy2(path, path.with_name(path.name + ".agent-monitor.bak"))
+
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}-",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, indent=2)
+            stream.write("\n")
+        os.chmod(temp_name, stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def copy_runtime(source_name: str, destination: Path):
+    source = source_dir() / source_name
+    if not source.exists():
+        raise RuntimeError(f"Hook source not found: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    destination.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+
+
+def remove_handlers(groups, predicate):
+    kept_groups = []
+    for group in groups if isinstance(groups, list) else []:
+        handlers = [
+            handler
+            for handler in group.get("hooks", [])
+            if not predicate(handler)
+        ]
+        if handlers:
+            updated = dict(group)
+            updated["hooks"] = handlers
+            kept_groups.append(updated)
+    return kept_groups
+
+
+def install_claude():
+    config = claude_dir() / "settings.json"
+    data = load_json(config, {})
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise RuntimeError(f"{config}: 'hooks' must be a JSON object")
+
+    for event in CLAUDE_EVENTS:
+        groups = hooks.setdefault(event, [])
+        exists = any(
+            handler.get("type") == "http" and handler.get("url") == CLAUDE_URL
+            for group in groups
+            for handler in group.get("hooks", [])
+        )
+        if not exists:
+            groups.append({
+                "matcher": "",
+                "hooks": [{
+                    "type": "http",
+                    "url": CLAUDE_URL,
+                    "timeout": 2,
+                }],
+            })
+    write_json(config, data)
+    print(f"[claude] installed in {config}")
+
+
+def check_claude() -> bool:
+    config = claude_dir() / "settings.json"
+    if not config.exists():
+        return False
+    data = load_json(config, {})
+    installed = set()
+    for event, groups in data.get("hooks", {}).items():
+        for group in groups if isinstance(groups, list) else []:
+            if any(
+                handler.get("type") == "http"
+                and handler.get("url") == CLAUDE_URL
+                for handler in group.get("hooks", [])
+            ):
+                installed.add(event)
+    return set(CLAUDE_EVENTS) <= installed
+
+
+def uninstall_claude():
+    config = claude_dir() / "settings.json"
+    if not config.exists():
+        print("[claude] not installed")
+        return
+    data = load_json(config, {})
+    hooks = data.get("hooks", {})
+    for event in list(hooks):
+        groups = remove_handlers(
+            hooks[event],
+            lambda handler: (
+                handler.get("type") == "http"
+                and handler.get("url") == CLAUDE_URL
+            ),
+        )
+        if groups:
+            hooks[event] = groups
+        else:
+            del hooks[event]
+    write_json(config, data)
+    print("[claude] uninstalled; other settings and hooks preserved")
+
+
+def codex_paths():
+    root = codex_dir()
+    return root / "hooks.json", root / "hooks" / "agent-monitor-hook"
+
+
+def codex_handler_matches(handler: dict, runtime: Path) -> bool:
+    return (
+        handler.get("type") == "command"
+        and handler.get("command") == str(runtime)
+    )
+
+
+def install_codex():
+    config, runtime = codex_paths()
+    copy_runtime("codex-hook", runtime)
+    data = load_json(
+        config,
+        {"description": "User-level Codex lifecycle hooks.", "hooks": {}},
+    )
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise RuntimeError(f"{config}: 'hooks' must be a JSON object")
+
+    for event in CODEX_EVENTS:
+        groups = remove_handlers(
+            hooks.setdefault(event, []),
+            lambda handler: codex_handler_matches(handler, runtime),
+        )
+        group = {
+            "hooks": [{
+                "type": "command",
+                "command": str(runtime),
+                "timeout": 305 if event == "PermissionRequest" else 2,
+                "statusMessage": (
+                    "Waiting for Agent Monitor hardware"
+                    if event == "PermissionRequest"
+                    else "Syncing Codex status"
+                ),
+            }]
+        }
+        if event in ("PreToolUse", "PermissionRequest", "PostToolUse"):
+            group["matcher"] = "*"
+        groups.append(group)
+        hooks[event] = groups
+    write_json(config, data)
+    print(f"[codex] installed in {config}")
+    print("[codex] run /hooks once to review and trust command hooks")
+
+
+def check_codex() -> bool:
+    config, runtime = codex_paths()
+    if not config.exists() or not runtime.exists() or not os.access(runtime, os.X_OK):
+        return False
+    data = load_json(config, {})
+    installed = set()
+    for event, groups in data.get("hooks", {}).items():
+        for group in groups if isinstance(groups, list) else []:
+            if any(
+                codex_handler_matches(handler, runtime)
+                for handler in group.get("hooks", [])
+            ):
+                installed.add(event)
+    return set(CODEX_EVENTS) <= installed
+
+
+def uninstall_codex():
+    config, runtime = codex_paths()
+    if config.exists():
+        data = load_json(config, {})
+        hooks = data.get("hooks", {})
+        for event in list(hooks):
+            groups = remove_handlers(
+                hooks[event],
+                lambda handler: codex_handler_matches(handler, runtime),
+            )
+            if groups:
+                hooks[event] = groups
+            else:
+                del hooks[event]
+        write_json(config, data)
+    if runtime.exists():
+        runtime.unlink()
+    print("[codex] uninstalled; other hooks preserved")
+
+
+def antigravity_paths():
+    root = antigravity_dir()
+    return root / "hooks.json", root / "hooks" / "agent-monitor-hook"
+
+
+def antigravity_definition(runtime: Path) -> dict:
+    def handler(event: str):
+        return {
+            "type": "command",
+            "command": f"{runtime} {event}",
+            "timeout": 305 if event == "PreToolUse" else 2,
+        }
+
+    return {
+        "PreToolUse": [{
+            "matcher": "run_command",
+            "hooks": [handler("PreToolUse")],
+        }],
+        "PostToolUse": [{
+            "matcher": "run_command",
+            "hooks": [handler("PostToolUse")],
+        }],
+        "PreInvocation": [handler("PreInvocation")],
+        "PostInvocation": [handler("PostInvocation")],
+        "Stop": [handler("Stop")],
+    }
+
+
+def install_antigravity():
+    config, runtime = antigravity_paths()
+    copy_runtime("antigravity-hook", runtime)
+    data = load_json(config, {})
+    data["agent-monitor"] = antigravity_definition(runtime)
+    write_json(config, data)
+    print(f"[antigravity] installed in {config}")
+    print("[antigravity] restart Antigravity and open a new task to load hooks")
+
+
+def check_antigravity() -> bool:
+    config, runtime = antigravity_paths()
+    if not config.exists() or not runtime.exists() or not os.access(runtime, os.X_OK):
+        return False
+    data = load_json(config, {})
+    return data.get("agent-monitor") == antigravity_definition(runtime)
+
+
+def uninstall_antigravity():
+    config, runtime = antigravity_paths()
+    if config.exists():
+        data = load_json(config, {})
+        data.pop("agent-monitor", None)
+        write_json(config, data)
+    if runtime.exists():
+        runtime.unlink()
+    print("[antigravity] uninstalled; other hooks preserved")
+
+
+ACTIONS = {
+    "claude": (install_claude, check_claude, uninstall_claude),
+    "codex": (install_codex, check_codex, uninstall_codex),
+    "antigravity": (
+        install_antigravity,
+        check_antigravity,
+        uninstall_antigravity,
+    ),
+}
+
+
+def selected_agents(values: Iterable[str]):
+    selected = []
+    for value in values:
+        normalized = "claude" if value == "claude_code" else value
+        if normalized not in SUPPORTED:
+            raise ValueError(f"Unsupported agent: {value}")
+        if normalized not in selected:
+            selected.append(normalized)
+    return selected or list(SUPPORTED)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "agents",
+        nargs="*",
+        help="Agents to manage (default: all supported)",
+    )
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--check", action="store_true")
+    action.add_argument("--uninstall", action="store_true")
+    action.add_argument("--list", action="store_true")
+    args = parser.parse_args()
+
+    if args.list:
+        print("\n".join(SUPPORTED))
+        return 0
+    try:
+        agents = selected_agents(args.agents)
+        if args.check:
+            success = True
+            for agent in agents:
+                installed = ACTIONS[agent][1]()
+                print(f"[{agent}] {'installed' if installed else 'not installed'}")
+                success = success and installed
+            return 0 if success else 1
+        if args.uninstall:
+            for agent in agents:
+                ACTIONS[agent][2]()
+            return 0
+        for agent in agents:
+            ACTIONS[agent][0]()
+        return 0
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"Installation failed: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
