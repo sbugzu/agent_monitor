@@ -6,7 +6,7 @@ Maintains registered adapters, tracks active agent, and dispatches hardware fram
 import logging
 import threading
 import time
-from typing import Dict, List, Optional, Any
+from typing import Any, Callable, Dict, List, Optional
 from agent_monitor.adapters.base import BaseAgentAdapter, NormalizedAgentEvent
 from agent_monitor.adapters.claude_code import ClaudeCodeAdapter
 from agent_monitor.adapters.codex import CodexAdapter
@@ -19,6 +19,7 @@ from agent_monitor.core.states import AgentState
 logger = logging.getLogger("AgentMonitorHub")
 
 class AgentMonitorHub:
+    HARDWARE_RECONNECT_GRACE_SECONDS = 15.0
     DEFAULT_WAITING_ACTIONS = (
         {"id": "reject", "label": "Reject", "dangerous": False},
         {"id": "allow_once", "label": "Allow Once", "dangerous": False},
@@ -32,7 +33,9 @@ class AgentMonitorHub:
         self.active_agent_id: Optional[str] = None
         self.hardware_callback = None
         self.hardware_connections: Dict[str, bool] = {}
+        self.hardware_reconnect_deadline = 0.0
         self.pending_interactions: Dict[str, Dict[str, Any]] = {}
+        self.queued_interactions: List[Dict[str, Any]] = []
         self.action_results: Dict[str, Dict[str, Any]] = {}
         self.approval_lifecycles: Dict[tuple, Dict[str, Any]] = {}
         self.interaction_coordinator = InteractionCoordinator(
@@ -59,7 +62,15 @@ class AgentMonitorHub:
             connected = bool(connected)
             if self.hardware_connections.get(transport) == connected:
                 return
+            was_connected = any(self.hardware_connections.values())
             self.hardware_connections[transport] = connected
+            is_connected = any(self.hardware_connections.values())
+            if is_connected:
+                self.hardware_reconnect_deadline = 0.0
+            elif was_connected:
+                self.hardware_reconnect_deadline = (
+                    time.monotonic() + self.HARDWARE_RECONNECT_GRACE_SECONDS
+                )
             self._interaction_changed.notify_all()
         logger.info(
             "Hardware transport %s: %s",
@@ -70,6 +81,14 @@ class AgentMonitorHub:
     def is_hardware_connected(self) -> bool:
         with self._interaction_lock:
             return any(self.hardware_connections.values())
+
+    def is_hardware_wait_available(self) -> bool:
+        """Allow a brief BLE/USB reconnect without discarding an approval."""
+        with self._interaction_lock:
+            return (
+                any(self.hardware_connections.values())
+                or time.monotonic() < self.hardware_reconnect_deadline
+            )
 
     def register_adapter(self, adapter: BaseAgentAdapter):
         self.adapters[adapter.agent_id] = adapter
@@ -92,7 +111,14 @@ class AgentMonitorHub:
             if not changed:
                 return
             if not present:
-                self.pending_interactions.pop(agent_id, None)
+                removed = self.pending_interactions.pop(agent_id, None)
+                self.queued_interactions = [
+                    interaction
+                    for interaction in self.queued_interactions
+                    if interaction["agent_id"] != agent_id
+                ]
+                if removed:
+                    self._promote_next_waiting_locked()
         logger.info("Agent client %s: %s", agent_id, "online" if present else "offline")
         self.notify_hardware()
 
@@ -105,7 +131,9 @@ class AgentMonitorHub:
                     continue
                 changed = True
                 if adapter.current_state != AgentState.WAITING_APPROVAL:
-                    self.pending_interactions.pop(agent_id, None)
+                    removed = self.pending_interactions.pop(agent_id, None)
+                    if removed:
+                        self._promote_next_waiting_locked()
                     self._interaction_changed.notify_all()
                 logger.info(
                     "Reconciled external task state for %s: %s",
@@ -248,8 +276,15 @@ class AgentMonitorHub:
             ),
         }
         self.pending_interactions[agent_id] = interaction
+        self._record_waiting_lifecycle(interaction)
+        return interaction
+
+    def _record_waiting_lifecycle(
+        self,
+        interaction: Dict[str, Any],
+    ) -> None:
         key = (
-            agent_id,
+            interaction["agent_id"],
             interaction["session_id"],
             interaction["request_id"],
         )
@@ -260,8 +295,13 @@ class AgentMonitorHub:
             and lifecycle_key != key
             and item.get("phase") == "approved_running"
         ]
+        lifecycle_interaction = {
+            field: value
+            for field, value in interaction.items()
+            if not field.startswith("_")
+        }
         self.approval_lifecycles[key] = {
-            **interaction,
+            **lifecycle_interaction,
             "phase": "new_approval",
         }
         while len(self.approval_lifecycles) > self.MAX_ACTION_RESULTS:
@@ -270,7 +310,7 @@ class AgentMonitorHub:
             logger.info(
                 "New approval #%s for %s session=%s request=%s while request=%s is executing",
                 interaction["sequence"],
-                agent_id,
+                interaction["agent_id"],
                 interaction["session_id"] or "-",
                 interaction["request_id"],
                 running[-1]["request_id"],
@@ -279,10 +319,118 @@ class AgentMonitorHub:
             logger.info(
                 "New approval #%s for %s session=%s request=%s",
                 interaction["sequence"],
-                agent_id,
+                interaction["agent_id"],
                 interaction["session_id"] or "-",
                 interaction["request_id"],
             )
+
+    def _current_waiting_interaction_locked(self) -> Optional[Dict[str, Any]]:
+        """Return the one waiting request allowed to own the display."""
+        if self.active_agent_id:
+            current = self.pending_interactions.get(self.active_agent_id)
+            if current:
+                return current
+        if not self.pending_interactions:
+            return None
+        return min(
+            self.pending_interactions.values(),
+            key=lambda interaction: interaction["sequence"],
+        )
+
+    def _queue_waiting_interaction(
+        self,
+        agent_id: str,
+        event: NormalizedAgentEvent,
+    ) -> Dict[str, Any]:
+        """Queue a waiting event without changing its adapter's visible state."""
+        request_id = str(event.request_id or "")
+        duplicate = next(
+            (
+                interaction
+                for interaction in (
+                    list(self.pending_interactions.values())
+                    + self.queued_interactions
+                )
+                if interaction["agent_id"] == agent_id
+                and interaction.get("session_id") == event.session_id
+                and request_id
+                and interaction["request_id"] == request_id
+            ),
+            None,
+        )
+        if duplicate:
+            return duplicate
+
+        self._interaction_sequence += 1
+        now = time.time()
+        interaction = {
+            "request_id": str(
+                event.request_id
+                or f"{agent_id}-{self._interaction_sequence}"
+            )[:64],
+            "agent_id": agent_id,
+            "session_id": event.session_id,
+            "actions": self._normalize_waiting_actions(event.payload),
+            "revision": 0,
+            "created_at": now,
+            # The actionable timeout starts when this item reaches the display.
+            "expires_at": 0.0,
+            "sequence": self._interaction_sequence,
+            "message": str(
+                event.message
+                or event.payload.get("tool_name")
+                or "approval"
+            ),
+            "tool_name": str(
+                event.payload.get("tool_name")
+                or event.payload.get("toolName")
+                or "Operation"
+            ),
+            "_event": event,
+        }
+        self.queued_interactions.append(interaction)
+        self._record_waiting_lifecycle(interaction)
+        lifecycle = self._approval_lifecycle(
+            agent_id,
+            interaction["session_id"],
+            interaction["request_id"],
+        )
+        if lifecycle:
+            lifecycle["phase"] = "queued"
+        logger.info(
+            "Queued approval #%s for %s behind the active waiting request",
+            interaction["sequence"],
+            agent_id,
+        )
+        return interaction
+
+    def _promote_next_waiting_locked(self) -> Optional[Dict[str, Any]]:
+        """Show the next queued waiting request after the current one closes."""
+        if self.pending_interactions or not self.queued_interactions:
+            return None
+        interaction = self.queued_interactions.pop(0)
+        event = interaction.pop("_event")
+        interaction["expires_at"] = time.time() + self.INTERACTION_TTL_SECONDS
+        adapter = self.adapters[interaction["agent_id"]]
+        adapter.apply_event(event)
+        self.pending_interactions[interaction["agent_id"]] = interaction
+        self.active_agent_id = interaction["agent_id"]
+        lifecycle = self._approval_lifecycle(
+            interaction["agent_id"],
+            interaction["session_id"],
+            interaction["request_id"],
+        )
+        if lifecycle:
+            lifecycle["phase"] = "new_approval"
+            lifecycle["promoted_at"] = time.time()
+            lifecycle["expires_at"] = interaction["expires_at"]
+        logger.info(
+            "Promoted queued approval #%s for %s session=%s request=%s",
+            interaction["sequence"],
+            interaction["agent_id"],
+            interaction["session_id"] or "-",
+            interaction["request_id"],
+        )
         return interaction
 
     def _approval_lifecycle(
@@ -330,6 +478,7 @@ class AgentMonitorHub:
             session_id or "-",
             request_id,
         )
+        self._promote_next_waiting_locked()
 
     def expire_interaction(self, request_id: str) -> bool:
         """Close an approval request whose blocking agent hook has timed out."""
@@ -343,8 +492,29 @@ class AgentMonitorHub:
                 None,
             )
             if not interaction:
+                interaction = next(
+                    (
+                        candidate
+                        for candidate in self.queued_interactions
+                        if candidate["request_id"] == request_id
+                    ),
+                    None,
+                )
+            if not interaction:
                 return False
-            self._expire_interaction_locked(interaction)
+            if interaction in self.queued_interactions:
+                self.queued_interactions.remove(interaction)
+                lifecycle = self._approval_lifecycle(
+                    interaction["agent_id"],
+                    interaction.get("session_id", ""),
+                    request_id,
+                )
+                if lifecycle:
+                    lifecycle["phase"] = "timed_out"
+                    lifecycle["timed_out_at"] = time.time()
+                self._interaction_changed.notify_all()
+            else:
+                self._expire_interaction_locked(interaction)
         self.notify_hardware()
         return True
 
@@ -444,6 +614,7 @@ class AgentMonitorHub:
                 "approval_selected",
                 selected_message,
             )
+            self._promote_next_waiting_locked()
 
         logger.info(
             "Approval #%s selected on hardware: %s for %s session=%s request=%s",
@@ -456,52 +627,131 @@ class AgentMonitorHub:
         self.notify_hardware()
         return True
 
+    def resolve_interaction_externally(
+        self,
+        request_id: str,
+        approved: bool = True,
+    ) -> bool:
+        """Close a request answered in the agent's own approval UI."""
+        with self._interaction_lock:
+            interaction = next(
+                (
+                    candidate
+                    for candidate in self.pending_interactions.values()
+                    if candidate["request_id"] == request_id
+                ),
+                None,
+            )
+            queued = False
+            if not interaction:
+                interaction = next(
+                    (
+                        candidate
+                        for candidate in self.queued_interactions
+                        if candidate["request_id"] == request_id
+                    ),
+                    None,
+                )
+                queued = interaction is not None
+            if not interaction:
+                return False
+
+            if queued:
+                self.queued_interactions.remove(interaction)
+            else:
+                self.pending_interactions.pop(interaction["agent_id"], None)
+
+            phase = "approved_running" if approved else "approval_rejected"
+            lifecycle = self._approval_lifecycle(
+                interaction["agent_id"],
+                interaction.get("session_id", ""),
+                request_id,
+            )
+            if lifecycle:
+                lifecycle["phase"] = phase
+                lifecycle["resolved_externally_at"] = time.time()
+
+            if not queued:
+                adapter = self.adapters.get(interaction["agent_id"])
+                if adapter:
+                    adapter.mark_approval_phase(
+                        interaction.get("session_id", ""),
+                        request_id,
+                        phase,
+                        (
+                            f"Approved in {adapter.display_name} · running "
+                            f"{interaction.get('message') or 'operation'}"
+                            if approved
+                            else f"Rejected in {adapter.display_name}"
+                        ),
+                    )
+                self._promote_next_waiting_locked()
+            self._interaction_changed.notify_all()
+
+        logger.info(
+            "Approval #%s resolved in agent UI: %s for %s request=%s",
+            interaction["sequence"],
+            "approved" if approved else "rejected",
+            interaction["agent_id"],
+            request_id,
+        )
+        self.notify_hardware()
+        return True
+
     def get_action_result(
         self,
         request_id: str,
         consume: bool = False,
+        retain: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        """Return a hardware decision for custom agents, optionally consuming it."""
+        """Return a hardware decision, optionally recording its delivery."""
         consumed = None
         with self._interaction_lock:
             result = self.action_results.get(request_id)
             if result and consume:
-                result = self.action_results.pop(request_id)
-                consumed = result
-                lifecycle = self._approval_lifecycle(
-                    result["agent_id"],
-                    result.get("session_id", ""),
-                    request_id,
-                )
-                phase = (
-                    "approval_rejected"
-                    if result["action_id"] == "reject"
-                    else "approved_running"
-                )
-                if lifecycle:
-                    lifecycle["phase"] = phase
-                    lifecycle["consumed_at"] = time.time()
-                adapter = self.adapters.get(result["agent_id"])
-                if adapter:
-                    adapter.mark_approval_phase(
+                if not retain:
+                    result = self.action_results.pop(request_id)
+                # HTTP delivery must be idempotent: a client may time out after
+                # the server has processed the GET but before it receives the
+                # response. Retained results let its next poll recover the
+                # exact same decision.
+                if not result.get("delivered_at"):
+                    result["delivered_at"] = time.time()
+                    consumed = result
+                    lifecycle = self._approval_lifecycle(
+                        result["agent_id"],
                         result.get("session_id", ""),
                         request_id,
-                        phase,
-                        (
-                            "Approval rejected"
-                            if phase == "approval_rejected"
-                            else f"Approved · running {result.get('message') or 'operation'}"
-                        ),
                     )
-                logger.info(
-                    "Approval #%s consumed by agent: %s for %s session=%s request=%s; phase=%s",
-                    result.get("sequence", "-"),
-                    result["action_id"],
-                    result["agent_id"],
-                    result.get("session_id") or "-",
-                    request_id,
-                    phase,
-                )
+                    phase = (
+                        "approval_rejected"
+                        if result["action_id"] == "reject"
+                        else "approved_running"
+                    )
+                    if lifecycle:
+                        lifecycle["phase"] = phase
+                        lifecycle["consumed_at"] = result["delivered_at"]
+                    adapter = self.adapters.get(result["agent_id"])
+                    if adapter:
+                        adapter.mark_approval_phase(
+                            result.get("session_id", ""),
+                            request_id,
+                            phase,
+                            (
+                                "Approval rejected"
+                                if phase == "approval_rejected"
+                                else f"Approved · running {result.get('message') or 'operation'}"
+                            ),
+                        )
+                    logger.info(
+                        "Approval #%s consumed by agent: %s for %s session=%s request=%s; phase=%s",
+                        result.get("sequence", "-"),
+                        result["action_id"],
+                        result["agent_id"],
+                        result.get("session_id") or "-",
+                        request_id,
+                        phase,
+                    )
             copied = dict(result) if result else None
         if consumed:
             self.notify_hardware()
@@ -511,26 +761,56 @@ class AgentMonitorHub:
         self,
         request_id: str,
         timeout: float,
+        cancelled: Optional[Callable[[], bool]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Wait for and consume one hardware decision from a blocking hook."""
-        deadline = time.monotonic() + max(0.0, timeout)
+        deadline = None
+        externally_resolved = False
         with self._interaction_changed:
             while request_id not in self.action_results:
-                if not any(
+                if cancelled and cancelled():
+                    externally_resolved = True
+                    break
+                is_active = any(
                     interaction["request_id"] == request_id
                     for interaction in self.pending_interactions.values()
-                ):
+                )
+                is_queued = any(
+                    interaction["request_id"] == request_id
+                    for interaction in self.queued_interactions
+                )
+                if not is_active and not is_queued:
                     break
-                if not any(self.hardware_connections.values()):
+                if not self.is_hardware_wait_available():
                     break
+                # Queued requests receive their full decision window only
+                # after the preceding waiting item has left the display.
+                if is_queued:
+                    self._interaction_changed.wait(
+                        0.25 if cancelled else None
+                    )
+                    continue
+                if deadline is None:
+                    deadline = time.monotonic() + max(0.0, timeout)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                self._interaction_changed.wait(remaining)
+                wait_for = min(remaining, 0.25) if cancelled else remaining
+                if not any(self.hardware_connections.values()):
+                    reconnect_remaining = (
+                        self.hardware_reconnect_deadline - time.monotonic()
+                    )
+                    if reconnect_remaining <= 0:
+                        break
+                    wait_for = min(wait_for, reconnect_remaining)
+                self._interaction_changed.wait(wait_for)
 
         result = self.get_action_result(request_id, consume=True)
         if result:
             return result
+        if externally_resolved:
+            self.resolve_interaction_externally(request_id, approved=True)
+            return None
         self.expire_interaction(request_id)
         return None
 
@@ -547,6 +827,44 @@ class AgentMonitorHub:
                 adapter.display_name = display_name
         with self._interaction_lock:
             event = adapter.translate_event(event_name, payload)
+            current = self._current_waiting_interaction_locked()
+
+            if event.opens_interaction and event.state == AgentState.WAITING_APPROVAL:
+                if current:
+                    interaction = self._queue_waiting_interaction(
+                        agent_id,
+                        event,
+                    )
+                    self._interaction_changed.notify_all()
+                    request_id = interaction["request_id"]
+                    # A queued wait must not change either the current agent or
+                    # the state currently rendered on the hardware.
+                    self.notify_hardware()
+                    return request_id
+
+            if (
+                current
+                and current["agent_id"] == agent_id
+                and (
+                    not event.session_id
+                    or not current.get("session_id")
+                    or event.session_id == current.get("session_id")
+                )
+                and event.state is not None
+                and event.state != AgentState.WAITING_APPROVAL
+                and not (
+                    event.completes_request
+                    and event.request_id == current["request_id"]
+                )
+                and not (
+                    event.name in ("permissiondenied", "posttoolusefailure")
+                    and event.request_id == current["request_id"]
+                )
+            ):
+                # Until the current wait is answered or expires, lifecycle
+                # noise for the same task cannot take over its display.
+                return current["request_id"]
+
             if not self.interaction_coordinator.accepts_event(
                 agent_id,
                 adapter,
@@ -564,10 +882,20 @@ class AgentMonitorHub:
                     normalized,
                 ),
             )
+            if (
+                current
+                and current not in self.pending_interactions.values()
+            ):
+                self._promote_next_waiting_locked()
 
             # Any meaningful lifecycle state makes the reporting agent visible and
             # active. IDLE adapters remain registered internally but stay hidden.
-            if adapter.current_state != AgentState.IDLE:
+            if (
+                adapter.current_state != AgentState.IDLE
+                and not self._current_waiting_interaction_locked()
+            ):
+                self.active_agent_id = agent_id
+            elif event.opens_interaction:
                 self.active_agent_id = agent_id
             self._interaction_changed.notify_all()
             interaction = self.pending_interactions.get(agent_id)

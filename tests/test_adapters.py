@@ -263,6 +263,67 @@ class TestAdapters(unittest.TestCase):
             "completed",
         )
 
+    def test_claude_cancelled_hook_marks_app_approval_as_running(self):
+        hub = AgentMonitorHub()
+        hub.set_hardware_connection("serial", True)
+        request_id = hub.dispatch_event(
+            "claude_code",
+            "PermissionRequest",
+            {
+                "session_id": "claude-task",
+                "request_id": "tool-1",
+                "tool_name": "Bash",
+                "tool_input": {"command": "npm test"},
+            },
+        )
+
+        result = hub.wait_for_action_result(
+            request_id,
+            timeout=300,
+            cancelled=lambda: True,
+        )
+
+        self.assertIsNone(result)
+        payload = hub.get_hardware_payload()
+        self.assertNotIn("interaction", payload)
+        self.assertEqual(payload["active"]["state"], "THINKING")
+        self.assertEqual(payload["active"]["phase"], "approved_running")
+        self.assertEqual(
+            hub.approval_lifecycles[
+                ("claude_code", "claude-task", "tool-1")
+            ]["phase"],
+            "approved_running",
+        )
+
+    def test_claude_permission_denied_closes_matching_wait(self):
+        hub = AgentMonitorHub()
+        tool_payload = {
+            "session_id": "claude-task",
+            "tool_use_id": "tool-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+        }
+        hub.dispatch_event("claude_code", "PreToolUse", tool_payload)
+        hub.dispatch_event(
+            "claude_code",
+            "PermissionRequest",
+            {
+                key: value
+                for key, value in tool_payload.items()
+                if key != "tool_use_id"
+            },
+        )
+
+        hub.dispatch_event(
+            "claude_code",
+            "PermissionDenied",
+            tool_payload,
+        )
+
+        payload = hub.get_hardware_payload()
+        self.assertNotIn("interaction", payload)
+        self.assertEqual(payload["active"]["state"], "ERROR")
+
     def test_claude_permission_denial_correlates_without_tool_use_id(self):
         adapter = ClaudeCodeAdapter()
         tool_payload = {
@@ -358,6 +419,29 @@ class TestAdapters(unittest.TestCase):
         self.assertIsNone(CODEX_HOOK.permission_decision("return"))
         self.assertIsNone(CODEX_HOOK.permission_decision(None))
 
+    def test_codex_cancelled_hook_resolves_native_app_approval(self):
+        payload = {
+            "hook_event_name": "PermissionRequest",
+            "session_id": "codex-task",
+            "tool_use_id": "tool-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+        }
+        with (
+            patch.object(CODEX_HOOK, "post_event", return_value=True),
+            patch.object(CODEX_HOOK, "install_cancellation_handler"),
+            patch.object(
+                CODEX_HOOK,
+                "wait_for_hardware_action",
+                side_effect=CODEX_HOOK.ApprovalHookCancelled,
+            ),
+            patch.object(CODEX_HOOK, "resolve_hardware_request") as resolve,
+            patch.object(CODEX_HOOK.json, "load", return_value=payload),
+        ):
+            CODEX_HOOK.main()
+
+        resolve.assert_called_once_with("tool-1")
+
     def test_codex_hook_uses_five_minute_approval_window(self):
         self.assertEqual(CODEX_HOOK.APPROVAL_TIMEOUT, 300)
 
@@ -374,6 +458,21 @@ class TestAdapters(unittest.TestCase):
 
         self.assertEqual(action, "allow_once")
         fetch.assert_called_once()
+
+    def test_codex_hook_retries_transient_poll_failure(self):
+        with (
+            patch.object(CODEX_HOOK, "APPROVAL_TIMEOUT", 10),
+            patch.object(
+                CODEX_HOOK,
+                "fetch_hardware_action",
+                side_effect=[OSError("transient"), "allow_once"],
+            ) as fetch,
+            patch.object(CODEX_HOOK.time, "sleep"),
+        ):
+            action = CODEX_HOOK.wait_for_hardware_action("retry-request")
+
+        self.assertEqual(action, "allow_once")
+        self.assertEqual(fetch.call_count, 2)
 
     def test_codex_hook_expires_request_after_timeout(self):
         with (
@@ -454,6 +553,21 @@ class TestAdapters(unittest.TestCase):
         hub.set_hardware_connection("serial", False)
         self.assertFalse(hub.is_hardware_connected())
 
+    @patch("agent_monitor.core.hub.time.monotonic")
+    def test_transient_hardware_disconnect_gets_reconnect_grace(self, monotonic):
+        monotonic.return_value = 100.0
+        hub = AgentMonitorHub()
+        hub.set_hardware_connection("ble", True)
+        hub.set_hardware_connection("ble", False)
+
+        self.assertFalse(hub.is_hardware_connected())
+        self.assertTrue(hub.is_hardware_wait_available())
+
+        monotonic.return_value = (
+            100.0 + hub.HARDWARE_RECONNECT_GRACE_SECONDS + 0.01
+        )
+        self.assertFalse(hub.is_hardware_wait_available())
+
     def test_blocking_hook_consumes_preselected_hardware_action(self):
         hub = AgentMonitorHub()
         request_id = hub.dispatch_event(
@@ -478,7 +592,7 @@ class TestAdapters(unittest.TestCase):
             "approved_running",
         )
 
-    def test_codex_new_tool_use_replaces_waiting_interaction(self):
+    def test_codex_new_tool_use_queues_behind_waiting_interaction(self):
         hub = AgentMonitorHub()
         for tool_use_id, command in (
             ("tool-1", "npm test"),
@@ -491,6 +605,11 @@ class TestAdapters(unittest.TestCase):
                 "tool_input": {"command": command},
             })
 
+        payload = hub.get_hardware_payload()
+        self.assertEqual(payload["interaction"]["request_id"], "tool-1")
+        self.assertEqual(payload["active"]["message"], "npm test")
+
+        self.assertTrue(hub.perform_active_action("tool-1", "allow_once"))
         payload = hub.get_hardware_payload()
         self.assertEqual(payload["interaction"]["request_id"], "tool-2")
         self.assertEqual(payload["active"]["message"], "npm run lint")
@@ -915,6 +1034,8 @@ class TestAdapters(unittest.TestCase):
         )
         consumed = hub.get_hardware_payload()["active"]
         self.assertEqual(consumed["phase"], "approved_running")
+        self.assertEqual(consumed["state"], "THINKING")
+        self.assertEqual(consumed["color"], "#FFB454")
         self.assertEqual(
             consumed["message"],
             "Approved · running git status --short",
@@ -946,6 +1067,58 @@ class TestAdapters(unittest.TestCase):
         self.assertEqual(
             ANTIGRAVITY_HOOK.permission_decision(None)["decision"],
             "ask",
+        )
+
+    def test_antigravity_cancelled_hook_resolves_native_app_approval(self):
+        payload = {
+            "conversationId": "antigravity-task",
+            "requestId": "tool-1",
+            "toolCall": {
+                "name": "run_command",
+                "args": {"CommandLine": "npm test"},
+            },
+        }
+        with (
+            patch.object(ANTIGRAVITY_HOOK, "post_event", return_value=True),
+            patch.object(ANTIGRAVITY_HOOK, "install_cancellation_handler"),
+            patch.object(
+                ANTIGRAVITY_HOOK,
+                "wait_for_hardware_action",
+                side_effect=ANTIGRAVITY_HOOK.ApprovalHookCancelled,
+            ),
+            patch.object(
+                ANTIGRAVITY_HOOK,
+                "resolve_hardware_request",
+            ) as resolve,
+            patch.object(
+                ANTIGRAVITY_HOOK.json,
+                "load",
+                return_value=payload,
+            ),
+            patch.object(
+                ANTIGRAVITY_HOOK.sys,
+                "argv",
+                ["antigravity-hook", "PreToolUse"],
+            ),
+        ):
+            ANTIGRAVITY_HOOK.main()
+
+        resolve.assert_called_once_with("tool-1")
+
+    def test_antigravity_expire_uses_daemon_url(self):
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value = response
+        with patch.object(
+            ANTIGRAVITY_HOOK.urllib.request,
+            "urlopen",
+            return_value=response,
+        ) as urlopen:
+            ANTIGRAVITY_HOOK.expire_hardware_request("tool-1")
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            request.full_url,
+            f"{ANTIGRAVITY_HOOK.DAEMON_URL}/api/v1/action/expire",
         )
 
     def test_antigravity_hardware_allow_overrides_exact_sandbox_escape(self):
@@ -1111,6 +1284,23 @@ class TestAdapters(unittest.TestCase):
         fetch.assert_called_once()
         sleep.assert_not_called()
 
+    def test_antigravity_hook_retries_transient_poll_failure(self):
+        with (
+            patch.object(ANTIGRAVITY_HOOK, "APPROVAL_TIMEOUT", 10),
+            patch.object(
+                ANTIGRAVITY_HOOK,
+                "fetch_hardware_action",
+                side_effect=[OSError("transient"), "allow_once"],
+            ) as fetch,
+            patch.object(ANTIGRAVITY_HOOK.time, "sleep"),
+        ):
+            action = ANTIGRAVITY_HOOK.wait_for_hardware_action(
+                "retry-request"
+            )
+
+        self.assertEqual(action, "allow_once")
+        self.assertEqual(fetch.call_count, 2)
+
     def test_generic_webhook_adapter(self):
         adapter = GenericWebhookAdapter("custom_bot", "Custom Bot")
         adapter.handle_event("custom_event", {"status": "THINKING", "message": "Processing..."})
@@ -1209,7 +1399,7 @@ class TestAdapters(unittest.TestCase):
         })
         self.assertEqual(actions[1]["id"], "retry")
 
-    def test_non_waiting_state_invalidates_interaction(self):
+    def test_non_waiting_state_cannot_replace_current_waiting_state(self):
         hub = AgentMonitorHub()
         hub.dispatch_event(
             "codex",
@@ -1218,10 +1408,87 @@ class TestAdapters(unittest.TestCase):
         )
         hub.dispatch_event("codex", "thinking", {"message": "Continuing"})
 
-        self.assertNotIn("interaction", hub.get_hardware_payload())
-        self.assertFalse(
+        payload = hub.get_hardware_payload()
+        self.assertEqual(payload["active"]["state"], "WAITING_APPROVAL")
+        self.assertEqual(payload["interaction"]["request_id"], "req-2")
+        self.assertTrue(
             hub.perform_active_action("req-2", "allow_once")
         )
+
+    def test_other_agent_status_cannot_take_over_current_waiting_display(self):
+        hub = AgentMonitorHub()
+        hub.dispatch_event("codex", "PermissionRequest", {
+            "session_id": "codex-task",
+            "request_id": "codex-wait",
+            "message": "Approve Codex?",
+        })
+
+        hub.dispatch_event("claude_code", "thinking", {
+            "session_id": "claude-task",
+            "message": "Claude is working",
+        })
+
+        payload = hub.get_hardware_payload()
+        self.assertEqual(payload["active"]["agent_id"], "codex")
+        self.assertEqual(payload["active"]["state"], "WAITING_APPROVAL")
+        self.assertEqual(
+            payload["interaction"]["request_id"],
+            "codex-wait",
+        )
+        self.assertEqual(
+            hub.adapters["claude_code"].current_state,
+            AgentState.THINKING,
+        )
+
+    def test_new_waiting_requests_are_displayed_in_fifo_order(self):
+        hub = AgentMonitorHub()
+        waits = (
+            ("codex", "codex-task", "wait-1"),
+            ("claude_code", "claude-task", "wait-2"),
+            ("antigravity", "antigravity-task", "wait-3"),
+        )
+        for agent_id, session_id, request_id in waits:
+            hub.dispatch_event(agent_id, "PermissionRequest", {
+                "session_id": session_id,
+                "request_id": request_id,
+                "message": request_id,
+            })
+
+        payload = hub.get_hardware_payload()
+        self.assertEqual(payload["active"]["agent_id"], "codex")
+        self.assertEqual(payload["interaction"]["request_id"], "wait-1")
+        self.assertEqual(
+            [item["request_id"] for item in hub.queued_interactions],
+            ["wait-2", "wait-3"],
+        )
+
+        self.assertTrue(hub.perform_active_action("wait-1", "allow_once"))
+        payload = hub.get_hardware_payload()
+        self.assertEqual(payload["active"]["agent_id"], "claude_code")
+        self.assertEqual(payload["interaction"]["request_id"], "wait-2")
+
+        self.assertTrue(hub.perform_active_action("wait-2", "reject"))
+        payload = hub.get_hardware_payload()
+        self.assertEqual(payload["active"]["agent_id"], "antigravity")
+        self.assertEqual(payload["interaction"]["request_id"], "wait-3")
+
+    def test_same_agent_waiting_requests_do_not_overwrite_each_other(self):
+        hub = AgentMonitorHub()
+        for request_id in ("wait-1", "wait-2"):
+            hub.dispatch_event("codex", "PermissionRequest", {
+                "session_id": "same-task",
+                "request_id": request_id,
+                "message": request_id,
+            })
+
+        self.assertEqual(
+            hub.get_hardware_payload()["interaction"]["request_id"],
+            "wait-1",
+        )
+        self.assertTrue(hub.perform_active_action("wait-1", "allow_once"))
+        payload = hub.get_hardware_payload()
+        self.assertEqual(payload["interaction"]["request_id"], "wait-2")
+        self.assertEqual(payload["active"]["message"], "wait-2")
 
     def test_idle_adapters_are_hidden_from_hardware(self):
         hub = AgentMonitorHub()

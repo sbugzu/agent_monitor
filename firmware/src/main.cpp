@@ -12,6 +12,8 @@
 #include <NimBLEDevice.h>
 #include <U8g2lib.h>
 #include <driver/gpio.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include "Arduino_GFX_Library.h"
 #include "pin_config.h"
 
@@ -103,6 +105,7 @@ BLECharacteristic *pTxCharacteristic = NULL;
 bool               bleConnected      = false;
 bool               serialConnected   = false;
 String             ble_rx_buffer     = "";
+QueueHandle_t       ble_rx_queue      = NULL;
 String             serial_rx_buffer  = "";
 bool               serial_rx_overflow = false;
 const size_t        SERIAL_RX_BUFFER_BYTES = 4096;
@@ -846,7 +849,14 @@ class RxCB : public BLECharacteristicCallbacks {
             String line = ble_rx_buffer.substring(0, newline);
             ble_rx_buffer.remove(0, newline + 1);
             line.trim();
-            if (line.length() > 0) processIncomingJSON(line);
+            if (line.length() > 0 && ble_rx_queue) {
+                // JSON parsing uses a 4 KB document. Defer it to loop() rather
+                // than consuming that stack inside NimBLE's callback task.
+                String *frame = new String(line);
+                if (!frame || xQueueSend(ble_rx_queue, &frame, 0) != pdTRUE) {
+                    delete frame;
+                }
+            }
         }
         if (ble_rx_buffer.length() > 2048) {
             ble_rx_buffer = "";
@@ -855,6 +865,10 @@ class RxCB : public BLECharacteristicCallbacks {
 };
 
 void initBLE() {
+    ble_rx_queue = xQueueCreate(4, sizeof(String *));
+    if (!ble_rx_queue) {
+        Serial.println("{\"event\":\"LOG\",\"msg\":\"BLE RX queue allocation failed\"}");
+    }
     BLEDevice::init("T-Encoder-Pro");
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new ServerCB());
@@ -1058,6 +1072,18 @@ void setup() {
 }
 
 void loop() {
+    // Parse complete BLE frames on the main Arduino task, where the large
+    // ArduinoJson document cannot overflow NimBLE's callback stack.
+    if (ble_rx_queue) {
+        String *frame = NULL;
+        while (xQueueReceive(ble_rx_queue, &frame, 0) == pdTRUE) {
+            if (frame) {
+                processIncomingJSON(*frame);
+                delete frame;
+            }
+        }
+    }
+
     // Assemble newline-delimited USB frames without blocking. The enlarged
     // CDC queue absorbs complete menu payloads while display rendering runs.
     while (Serial.available()) {

@@ -5,6 +5,8 @@ Provides REST API endpoints for agent hookers and command line wrappers.
 
 import json
 import logging
+import select
+import socket
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import threading
 from typing import Any, Dict, Optional
@@ -31,6 +33,27 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _client_disconnected(self) -> bool:
+        """Detect a Claude hook request cancelled by its native approval UI."""
+        connection = getattr(self, "connection", None)
+        if connection is None:
+            return False
+        try:
+            readable, _, _ = select.select([connection], [], [], 0)
+            if not readable:
+                return False
+            return (
+                connection.recv(
+                    1,
+                    socket.MSG_PEEK | socket.MSG_DONTWAIT,
+                )
+                == b""
+            )
+        except BlockingIOError:
+            return False
+        except OSError:
+            return True
+
     def do_OPTIONS(self):
         self._send_json(200, {"status": "ok"})
 
@@ -51,10 +74,16 @@ class APIHandler(BaseHTTPRequestHandler):
                     {"status": "error", "message": "request_id is required"},
                 )
                 return
-            result = self.hub.get_action_result(request_id, consume=consume)
+            result = self.hub.get_action_result(
+                request_id,
+                consume=consume,
+                # Polling hooks use short HTTP timeouts. Keep a delivered
+                # decision available so a lost response can be retried.
+                retain=consume,
+            )
             if result:
                 self._send_json(200, {"status": "success", "data": result})
-            elif not self.hub.is_hardware_connected():
+            elif not self.hub.is_hardware_wait_available():
                 self._send_json(
                     409,
                     {
@@ -111,11 +140,13 @@ class APIHandler(BaseHTTPRequestHandler):
             result = self.hub.wait_for_action_result(
                 request_id,
                 self.CLAUDE_APPROVAL_TIMEOUT_SECONDS,
+                cancelled=self._client_disconnected,
             )
             if not result:
                 # Empty success leaves the native Claude permission dialog in
                 # control when hardware is offline or the request times out.
-                self._send_empty()
+                if not self._client_disconnected():
+                    self._send_empty()
                 return
 
             action_id = result["action_id"]
@@ -156,6 +187,25 @@ class APIHandler(BaseHTTPRequestHandler):
                     {"status": "error", "message": "request_id is required"},
                 )
             elif self.hub.expire_interaction(request_id):
+                self._send_json(200, {"status": "success"})
+            else:
+                self._send_json(
+                    404,
+                    {"status": "stale", "message": "Approval is no longer pending"},
+                )
+
+        elif self.path == "/api/v1/action/resolve":
+            request_id = str(body.get("request_id") or "")
+            approved = body.get("approved", True) is not False
+            if not request_id:
+                self._send_json(
+                    400,
+                    {"status": "error", "message": "request_id is required"},
+                )
+            elif self.hub.resolve_interaction_externally(
+                request_id,
+                approved=approved,
+            ):
                 self._send_json(200, {"status": "success"})
             else:
                 self._send_json(

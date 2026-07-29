@@ -39,6 +39,22 @@ class TestServer(unittest.TestCase):
         handler.do_POST()
         return self.responses[-1]
 
+    def resolve_action(self, request_id, approved=True):
+        handler = APIHandler.__new__(APIHandler)
+        handler.hub = self.hub
+        handler.path = "/api/v1/action/resolve"
+        body = json.dumps({
+            "request_id": request_id,
+            "approved": approved,
+        }).encode("utf-8")
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler._send_json = lambda status, payload: self.responses.append(
+            (status, payload)
+        )
+        handler.do_POST()
+        return self.responses[-1]
+
     def post_claude_hook(self, payload):
         handler = APIHandler.__new__(APIHandler)
         handler.hub = self.hub
@@ -66,6 +82,14 @@ class TestServer(unittest.TestCase):
         status, _ = self.get_action("pending-request")
         self.assertEqual(status, 404)
 
+    def test_pending_action_remains_pending_during_reconnect_grace(self):
+        self.hub.set_hardware_connection("ble", True)
+        self.hub.set_hardware_connection("ble", False)
+
+        status, _ = self.get_action("pending-request")
+
+        self.assertEqual(status, 404)
+
     def test_selected_action_can_be_consumed_after_disconnect(self):
         self.hub.set_hardware_connection("serial", True)
         self.hub.dispatch_event(
@@ -87,6 +111,12 @@ class TestServer(unittest.TestCase):
         status, body = self.get_action("selected-request")
         self.assertEqual(status, 200)
         self.assertEqual(body["data"]["action_id"], "allow_once")
+
+        # A lost HTTP response can be retried without losing the hardware
+        # decision or applying its lifecycle transition twice.
+        status, retry_body = self.get_action("selected-request")
+        self.assertEqual(status, 200)
+        self.assertEqual(retry_body["data"]["action_id"], "allow_once")
 
     def test_hook_timeout_expires_pending_hardware_action(self):
         self.hub.dispatch_event(
@@ -112,6 +142,25 @@ class TestServer(unittest.TestCase):
             )
         )
 
+    def test_native_app_can_resolve_pending_hardware_action(self):
+        self.hub.dispatch_event(
+            "codex",
+            "PermissionRequest",
+            {
+                "session_id": "native-task",
+                "request_id": "native-request",
+                "message": "Approve command?",
+            },
+        )
+
+        status, _ = self.resolve_action("native-request")
+        payload = self.hub.get_hardware_payload()
+
+        self.assertEqual(status, 200)
+        self.assertNotIn("interaction", payload)
+        self.assertEqual(payload["active"]["state"], "THINKING")
+        self.assertEqual(payload["active"]["phase"], "approved_running")
+
     def test_claude_permission_request_returns_hardware_allow(self):
         with patch.object(
             self.hub,
@@ -129,6 +178,7 @@ class TestServer(unittest.TestCase):
         wait.assert_called_once_with(
             request_id,
             APIHandler.CLAUDE_APPROVAL_TIMEOUT_SECONDS,
+            cancelled=unittest.mock.ANY,
         )
         self.assertEqual(status, 200)
         self.assertEqual(

@@ -3,6 +3,7 @@
 
 import json
 import os
+import signal
 import sys
 import time
 import urllib.request
@@ -18,7 +19,20 @@ APPROVAL_TIMEOUT = float(
     os.environ.get("AGENT_MONITOR_APPROVAL_TIMEOUT", "300")
 )
 POLL_INTERVAL = 0.25
+POLL_FAILURE_GRACE = 5.0
 HARDWARE_OFFLINE = "hardware_offline"
+
+
+class ApprovalHookCancelled(Exception):
+    """Raised when Codex resolves or cancels its native approval UI."""
+
+
+def install_cancellation_handler() -> None:
+    def handle_cancel(signum, frame):
+        raise ApprovalHookCancelled()
+
+    signal.signal(signal.SIGTERM, handle_cancel)
+    signal.signal(signal.SIGINT, handle_cancel)
 
 
 def post_event(payload: dict) -> bool:
@@ -63,6 +77,23 @@ def expire_hardware_request(request_id: str) -> None:
         pass
 
 
+def resolve_hardware_request(request_id: str, approved: bool = True) -> None:
+    request = urllib.request.Request(
+        f"{HOST_URL}/api/v1/action/resolve",
+        data=json.dumps({
+            "request_id": request_id,
+            "approved": approved,
+        }).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=0.5):
+            pass
+    except Exception:
+        pass
+
+
 def wait_for_hardware_action(request_id: str):
     encoded_request_id = urllib.parse.quote(request_id, safe="")
     action_url = (
@@ -70,16 +101,22 @@ def wait_for_hardware_action(request_id: str):
         f"?request_id={encoded_request_id}&consume=true"
     )
     deadline = time.monotonic() + APPROVAL_TIMEOUT
+    failure_started_at = None
     while time.monotonic() < deadline:
         try:
             action_id = fetch_hardware_action(action_url)
+            failure_started_at = None
             if action_id == HARDWARE_OFFLINE:
                 expire_hardware_request(request_id)
                 return None
             if action_id:
                 return action_id
         except Exception:
-            return None
+            now = time.monotonic()
+            if failure_started_at is None:
+                failure_started_at = now
+            elif now - failure_started_at >= POLL_FAILURE_GRACE:
+                return None
         time.sleep(POLL_INTERVAL)
 
     # Close the boundary race where a hardware choice arrives after the final
@@ -142,7 +179,16 @@ def main() -> None:
     if not request_id:
         return
 
-    decision = permission_decision(wait_for_hardware_action(request_id))
+    install_cancellation_handler()
+    try:
+        action_id = wait_for_hardware_action(request_id)
+    except ApprovalHookCancelled:
+        # Codex cancelled the polling hook because the native approval UI
+        # handled the request. Release the hardware wait immediately.
+        resolve_hardware_request(request_id)
+        return
+
+    decision = permission_decision(action_id)
     if decision:
         json.dump(decision, sys.stdout)
         sys.stdout.write("\n")

@@ -5,6 +5,8 @@ Unit tests for protocol payload formatting and state transitions.
 import unittest
 import json
 import asyncio
+import sys
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from agent_monitor.core.states import AgentState, STATE_COLORS
 from agent_monitor.core.hub import AgentMonitorHub
@@ -218,6 +220,7 @@ class TestProtocol(unittest.TestCase):
 
     def test_ble_bridge_splits_large_write(self):
         bridge = BLEBridge()
+        bridge.chunk_interval = 0
         bridge.client = Mock()
         bridge.client.is_connected = True
         bridge.client.write_gatt_char = Mock(
@@ -231,6 +234,112 @@ class TestProtocol(unittest.TestCase):
             for call in bridge.client.write_gatt_char.call_args_list
         ]
         self.assertEqual([len(chunk) for chunk in chunks], [20, 20, 5])
+        self.assertTrue(
+            all(
+                call.kwargs["response"] is False
+                for call in bridge.client.write_gatt_char.call_args_list
+            )
+        )
+
+    def test_ble_bridge_serializes_and_coalesces_pending_frames(self):
+        bridge = BLEBridge()
+        writes = []
+
+        async def exercise():
+            first_write_started = asyncio.Event()
+            release_first_write = asyncio.Event()
+
+            async def controlled_write(frame):
+                writes.append(frame)
+                if len(writes) == 1:
+                    first_write_started.set()
+                    await release_first_write.wait()
+
+            bridge._async_write = controlled_write
+            bridge._enqueue_frame(b"first")
+            await first_write_started.wait()
+            bridge._enqueue_frame(b"stale")
+            bridge._enqueue_frame(b"latest")
+            release_first_write.set()
+            await bridge._writer_task
+
+        asyncio.run(exercise())
+
+        self.assertEqual(writes, [b"first", b"latest"])
+
+    def test_ble_bridge_write_timeout_does_not_lock_writer(self):
+        bridge = BLEBridge()
+        bridge.chunk_interval = 0
+        bridge.write_timeout = 0.01
+        bridge.client = Mock()
+        bridge.client.is_connected = True
+
+        async def never_finishes(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        async def disconnect():
+            bridge.client.is_connected = False
+
+        bridge.client.write_gatt_char = never_finishes
+        bridge.client.disconnect = disconnect
+
+        asyncio.run(bridge._async_write(b"frame"))
+
+        self.assertFalse(bridge.client.is_connected)
+
+    def test_ble_connect_replays_current_state_after_subscribing(self):
+        events = []
+        handler = Mock(side_effect=lambda payload: events.append(("event", payload)))
+        connection_handler = Mock(
+            side_effect=lambda connected: events.append(("connection", connected))
+        )
+        bridge = BLEBridge(
+            event_handler=handler,
+            connection_handler=connection_handler,
+        )
+        bridge.running = True
+
+        class FakeScanner:
+            @staticmethod
+            async def find_device_by_name(_name, timeout):
+                return SimpleNamespace(name="T-Encoder-Pro", address="test-device")
+
+        class FakeClient:
+            def __init__(self, _device, timeout):
+                self.is_connected = True
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                self.is_connected = False
+
+            async def start_notify(self, _uuid, _callback):
+                events.append(("subscribed", True))
+
+        fake_bleak = SimpleNamespace(
+            BleakScanner=FakeScanner,
+            BleakClient=FakeClient,
+        )
+        with patch.dict(sys.modules, {"bleak": fake_bleak}):
+            async def connect_once():
+                task = asyncio.create_task(bridge._main_ble_loop())
+                while not handler.called:
+                    await asyncio.sleep(0)
+                bridge.running = False
+                await task
+
+            asyncio.run(connect_once())
+
+        handler.assert_called_once_with({"event": "READY", "transport": "ble"})
+        self.assertLess(
+            events.index(("subscribed", True)),
+            events.index(("event", {"event": "READY", "transport": "ble"})),
+        )
+        self.assertEqual(
+            connection_handler.call_args_list,
+            [unittest.mock.call(True), unittest.mock.call(False)],
+        )
 
     def test_ble_connection_notifications_are_deduplicated(self):
         connection_handler = Mock()

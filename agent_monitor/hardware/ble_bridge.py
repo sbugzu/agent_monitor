@@ -33,6 +33,10 @@ class BLEBridge:
         self.thread: Optional[threading.Thread] = None
         self.running: bool = False
         self._notification_buffer = bytearray()
+        self._pending_frame: Optional[bytes] = None
+        self._writer_task = None
+        self.chunk_interval = 0.005
+        self.write_timeout = 1.0
 
     def start(self):
         self.running = True
@@ -55,7 +59,26 @@ class BLEBridge:
         if not self.loop or not self.client or not self.client.is_connected:
             return
         frame = encode_hardware_frame(payload)
-        asyncio.run_coroutine_threadsafe(self._async_write(frame), self.loop)
+        # Hub notifications can originate from several HTTP threads. Marshal
+        # them onto the BLE loop so chunks from different JSON frames can
+        # never interleave on the UART characteristic.
+        self.loop.call_soon_threadsafe(self._enqueue_frame, frame)
+
+    def _enqueue_frame(self, frame: bytes):
+        # State is snapshot-based, so while one frame is in flight only the
+        # newest pending snapshot matters.
+        self._pending_frame = frame
+        if not self._writer_task or self._writer_task.done():
+            self._writer_task = asyncio.create_task(self._drain_writes())
+
+    async def _drain_writes(self):
+        try:
+            while self._pending_frame is not None:
+                frame = self._pending_frame
+                self._pending_frame = None
+                await self._async_write(frame)
+        finally:
+            self._writer_task = None
 
     async def _async_write(self, data: bytes):
         try:
@@ -63,13 +86,34 @@ class BLEBridge:
                 # Twenty-byte chunks work before and after MTU negotiation.
                 # Firmware reassembles newline-delimited frames.
                 for offset in range(0, len(data), 20):
-                    await self.client.write_gatt_char(
-                        NUS_RX_CHAR_UUID,
-                        data[offset:offset + 20],
-                        response=False,
+                    await asyncio.wait_for(
+                        self.client.write_gatt_char(
+                            NUS_RX_CHAR_UUID,
+                            data[offset:offset + 20],
+                            response=False,
+                        ),
+                        timeout=self.write_timeout,
                     )
+                    # A single writer prevents frame interleaving; a short
+                    # pause supplies enough back-pressure without making every
+                    # 20-byte chunk wait for a BLE round trip.
+                    if self.chunk_interval > 0:
+                        await asyncio.sleep(self.chunk_interval)
         except Exception as e:
-            logger.error(f"BLE write error: {e}")
+            logger.error("BLE write error (%s): %r", type(e).__name__, e)
+            # A timed-out CoreBluetooth write can leave the connection alive
+            # while its outbound queue is permanently wedged. Force the normal
+            # reconnect path; READY replay will resend the latest hub snapshot.
+            client = self.client
+            if client and client.is_connected:
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=2.0)
+                except Exception as disconnect_error:
+                    logger.error(
+                        "BLE disconnect after write failure (%s): %r",
+                        type(disconnect_error).__name__,
+                        disconnect_error,
+                    )
 
     def _notification_handler(self, sender, data: bytes):
         try:
@@ -112,8 +156,14 @@ class BLEBridge:
                     self.client = client
                     self._notification_buffer.clear()
                     logger.info("Connected to Lilygo T-Encoder Pro over BLE!")
-                    self._set_connected(True)
                     await client.start_notify(NUS_TX_CHAR_UUID, self._notification_handler)
+                    self._set_connected(True)
+                    # The firmware's boot-time READY notification is commonly
+                    # sent before the daemon connects and subscribes. Request
+                    # an immediate replay of the current hub state, matching
+                    # the serial bridge's reconnect behavior.
+                    if self.event_handler:
+                        self.event_handler({"event": "READY", "transport": "ble"})
 
                     while self.running and client.is_connected:
                         await asyncio.sleep(1.0)
@@ -121,6 +171,12 @@ class BLEBridge:
                 logger.error(f"BLE connection error: {e}")
             finally:
                 self.client = None
+                self._pending_frame = None
+                writer_task = self._writer_task
+                self._writer_task = None
+                if writer_task and not writer_task.done():
+                    writer_task.cancel()
+                    await asyncio.gather(writer_task, return_exceptions=True)
                 self._set_connected(False)
             if self.running:
                 await asyncio.sleep(3.0)

@@ -8,6 +8,7 @@ deliberately non-fatal so this observer can never block an agent run.
 
 import json
 import os
+import signal
 import sys
 import time
 import urllib.error
@@ -24,7 +25,20 @@ APPROVAL_TIMEOUT = float(
     os.environ.get("AGENT_MONITOR_APPROVAL_TIMEOUT", "300")
 )
 POLL_INTERVAL = 0.25
+POLL_FAILURE_GRACE = 5.0
 HARDWARE_OFFLINE = "hardware_offline"
+
+
+class ApprovalHookCancelled(Exception):
+    """Raised when Antigravity resolves or cancels its native approval UI."""
+
+
+def install_cancellation_handler() -> None:
+    def handle_cancel(signum, frame):
+        raise ApprovalHookCancelled()
+
+    signal.signal(signal.SIGTERM, handle_cancel)
+    signal.signal(signal.SIGINT, handle_cancel)
 
 
 def post_event(event: str, payload: dict) -> bool:
@@ -63,8 +77,25 @@ def fetch_hardware_action(action_url: str):
 
 def expire_hardware_request(request_id: str) -> None:
     request = urllib.request.Request(
-        f"{HOST_URL}/api/v1/action/expire",
+        f"{DAEMON_URL}/api/v1/action/expire",
         data=json.dumps({"request_id": request_id}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=0.5):
+            pass
+    except Exception:
+        pass
+
+
+def resolve_hardware_request(request_id: str, approved: bool = True) -> None:
+    request = urllib.request.Request(
+        f"{DAEMON_URL}/api/v1/action/resolve",
+        data=json.dumps({
+            "request_id": request_id,
+            "approved": approved,
+        }).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -82,16 +113,22 @@ def wait_for_hardware_action(request_id: str):
         f"?request_id={encoded_request_id}&consume=true"
     )
     deadline = time.monotonic() + APPROVAL_TIMEOUT
+    failure_started_at = None
     while time.monotonic() < deadline:
         try:
             action_id = fetch_hardware_action(action_url)
+            failure_started_at = None
             if action_id == HARDWARE_OFFLINE:
                 expire_hardware_request(request_id)
                 return None
             if action_id:
                 return action_id
         except Exception:
-            return None
+            now = time.monotonic()
+            if failure_started_at is None:
+                failure_started_at = now
+            elif now - failure_started_at >= POLL_FAILURE_GRACE:
+                return None
         time.sleep(POLL_INTERVAL)
 
     try:
@@ -164,10 +201,15 @@ def main() -> None:
             {"id": "allow_once", "label": "Allow Once"},
         ]
         if post_event(event, payload):
-            result = permission_decision(
-                wait_for_hardware_action(request_id),
-                payload,
-            )
+            install_cancellation_handler()
+            try:
+                action_id = wait_for_hardware_action(request_id)
+            except ApprovalHookCancelled:
+                # Antigravity cancelled the polling hook because its native
+                # approval UI handled the request.
+                resolve_hardware_request(request_id)
+                return
+            result = permission_decision(action_id, payload)
         else:
             result = permission_decision(None)
     elif normalized_event == "stop":
