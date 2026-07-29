@@ -25,6 +25,8 @@ CLAUDE_EVENTS = (
     "UserPromptSubmit",
     "PreToolUse",
     "PermissionRequest",
+    "PermissionDenied",
+    "PostToolUse",
     "PostToolUseFailure",
     "StopFailure",
     "Stop",
@@ -131,21 +133,22 @@ def install_claude():
         raise RuntimeError(f"{config}: 'hooks' must be a JSON object")
 
     for event in CLAUDE_EVENTS:
-        groups = hooks.setdefault(event, [])
-        exists = any(
-            handler.get("type") == "http" and handler.get("url") == CLAUDE_URL
-            for group in groups
-            for handler in group.get("hooks", [])
+        groups = remove_handlers(
+            hooks.setdefault(event, []),
+            lambda handler: (
+                handler.get("type") == "http"
+                and handler.get("url") == CLAUDE_URL
+            ),
         )
-        if not exists:
-            groups.append({
-                "matcher": "",
-                "hooks": [{
-                    "type": "http",
-                    "url": CLAUDE_URL,
-                    "timeout": 2,
-                }],
-            })
+        groups.append({
+            "matcher": "",
+            "hooks": [{
+                "type": "http",
+                "url": CLAUDE_URL,
+                "timeout": 305 if event == "PermissionRequest" else 2,
+            }],
+        })
+        hooks[event] = groups
     write_json(config, data)
     print(f"[claude] installed in {config}")
 

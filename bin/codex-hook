@@ -49,6 +49,20 @@ def fetch_hardware_action(action_url: str):
     return None
 
 
+def expire_hardware_request(request_id: str) -> None:
+    request = urllib.request.Request(
+        f"{HOST_URL}/api/v1/action/expire",
+        data=json.dumps({"request_id": request_id}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=0.5):
+            pass
+    except Exception:
+        pass
+
+
 def wait_for_hardware_action(request_id: str):
     encoded_request_id = urllib.parse.quote(request_id, safe="")
     action_url = (
@@ -60,6 +74,7 @@ def wait_for_hardware_action(request_id: str):
         try:
             action_id = fetch_hardware_action(action_url)
             if action_id == HARDWARE_OFFLINE:
+                expire_hardware_request(request_id)
                 return None
             if action_id:
                 return action_id
@@ -71,9 +86,12 @@ def wait_for_hardware_action(request_id: str):
     # pending response but just as the monotonic deadline is crossed.
     try:
         action_id = fetch_hardware_action(action_url)
-        return None if action_id == HARDWARE_OFFLINE else action_id
+        if action_id and action_id != HARDWARE_OFFLINE:
+            return action_id
     except Exception:
-        return None
+        pass
+    expire_hardware_request(request_id)
+    return None
 
 
 def permission_decision(action_id: str):

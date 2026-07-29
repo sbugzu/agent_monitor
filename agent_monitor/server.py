@@ -5,7 +5,7 @@ Provides REST API endpoints for agent hookers and command line wrappers.
 
 import json
 import logging
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import threading
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
@@ -15,6 +15,7 @@ logger = logging.getLogger("MonitorServer")
 
 class APIHandler(BaseHTTPRequestHandler):
     hub: AgentMonitorHub = None
+    CLAUDE_APPROVAL_TIMEOUT_SECONDS = 300
 
     def _send_json(self, status_code: int, data: Dict[str, Any]):
         self.send_response(status_code)
@@ -80,20 +81,57 @@ class APIHandler(BaseHTTPRequestHandler):
 
         if self.path == "/api/v1/hooks/claude":
             event_name = body.get("hook_event_name") or "update"
+            is_permission_request = event_name.lower() == "permissionrequest"
+            if is_permission_request:
+                body["actions"] = [
+                    {"id": "reject", "label": "Reject"},
+                    {"id": "allow_once", "label": "Allow Once"},
+                ]
+                if body.get("permission_suggestions"):
+                    body["actions"].append({
+                        "id": "always_allow",
+                        "label": "Always Allow",
+                        "dangerous": True,
+                    })
             logger.info(
                 "Received Claude Hook - Event: %s, Session: %s",
                 event_name,
                 body.get("session_id", "unknown"),
             )
-            self.hub.dispatch_event(
+            request_id = self.hub.dispatch_event(
                 "claude_code",
                 event_name,
                 body,
                 display_name="Claude Code",
             )
-            # Claude HTTP hooks treat a 2xx empty body as an observational
-            # success with no lifecycle decision or model-visible context.
-            self._send_empty()
+            if not is_permission_request or not request_id:
+                self._send_empty()
+                return
+
+            result = self.hub.wait_for_action_result(
+                request_id,
+                self.CLAUDE_APPROVAL_TIMEOUT_SECONDS,
+            )
+            if not result:
+                # Empty success leaves the native Claude permission dialog in
+                # control when hardware is offline or the request times out.
+                self._send_empty()
+                return
+
+            action_id = result["action_id"]
+            decision = {
+                "behavior": "deny" if action_id == "reject" else "allow",
+            }
+            if action_id == "reject":
+                decision["message"] = "Rejected on Agent Monitor hardware."
+            elif action_id == "always_allow":
+                decision["updatedPermissions"] = body["permission_suggestions"]
+            self._send_json(200, {
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": decision,
+                },
+            })
 
         elif self.path == "/api/v1/hooks/codex":
             event_name = body.get("hook_event_name") or "update"
@@ -109,6 +147,21 @@ class APIHandler(BaseHTTPRequestHandler):
                 display_name="Codex Agent",
             )
             self._send_empty()
+
+        elif self.path == "/api/v1/action/expire":
+            request_id = str(body.get("request_id") or "")
+            if not request_id:
+                self._send_json(
+                    400,
+                    {"status": "error", "message": "request_id is required"},
+                )
+            elif self.hub.expire_interaction(request_id):
+                self._send_json(200, {"status": "success"})
+            else:
+                self._send_json(
+                    404,
+                    {"status": "stale", "message": "Approval is no longer pending"},
+                )
 
         elif self.path == "/api/v1/event":
             agent_id = body.get("agent") or body.get("agent_id") or "generic"
@@ -150,12 +203,12 @@ class MonitorServer:
         self.hub = hub
         self.host = host
         self.port = port
-        self.httpd: Optional[HTTPServer] = None
+        self.httpd: Optional[ThreadingHTTPServer] = None
         self.thread: Optional[threading.Thread] = None
 
     def start(self):
         APIHandler.hub = self.hub
-        self.httpd = HTTPServer((self.host, self.port), APIHandler)
+        self.httpd = ThreadingHTTPServer((self.host, self.port), APIHandler)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
         logger.info(f"Agent Monitor Daemon API Server running at http://{self.host}:{self.port}")

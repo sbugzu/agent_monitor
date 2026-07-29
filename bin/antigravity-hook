@@ -61,6 +61,20 @@ def fetch_hardware_action(action_url: str):
     return None
 
 
+def expire_hardware_request(request_id: str) -> None:
+    request = urllib.request.Request(
+        f"{HOST_URL}/api/v1/action/expire",
+        data=json.dumps({"request_id": request_id}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=0.5):
+            pass
+    except Exception:
+        pass
+
+
 def wait_for_hardware_action(request_id: str):
     encoded_request_id = urllib.parse.quote(request_id, safe="")
     action_url = (
@@ -72,6 +86,7 @@ def wait_for_hardware_action(request_id: str):
         try:
             action_id = fetch_hardware_action(action_url)
             if action_id == HARDWARE_OFFLINE:
+                expire_hardware_request(request_id)
                 return None
             if action_id:
                 return action_id
@@ -81,17 +96,42 @@ def wait_for_hardware_action(request_id: str):
 
     try:
         action_id = fetch_hardware_action(action_url)
-        return None if action_id == HARDWARE_OFFLINE else action_id
+        if action_id and action_id != HARDWARE_OFFLINE:
+            return action_id
     except Exception:
+        pass
+    expire_hardware_request(request_id)
+    return None
+
+
+def unsandboxed_permission_override(payload: dict):
+    """Return a call-scoped sandbox bypass resource, when explicitly requested."""
+    tool_call = payload.get("toolCall") or {}
+    args = tool_call.get("args") or {}
+    if not isinstance(args, dict) or args.get("BypassSandbox") is not True:
         return None
 
+    command = args.get("CommandLine")
+    if isinstance(command, list):
+        command = " ".join(str(part) for part in command)
+    if not isinstance(command, str) or not command.strip():
+        return None
+    return f"unsandboxed({command.strip()})"
 
-def permission_decision(action_id):
+
+def permission_decision(action_id, payload=None):
     if action_id == "allow_once":
-        return {
+        result = {
             "decision": "allow",
             "reason": "Approved on Agent Monitor hardware.",
         }
+        override = unsandboxed_permission_override(payload or {})
+        if override:
+            # Antigravity treats command execution and escaping the terminal
+            # sandbox as separate permission resources. Keep this override
+            # scoped to the exact command approved on hardware.
+            result["permissionOverrides"] = [override]
+        return result
     if action_id == "reject":
         return {
             "decision": "deny",
@@ -125,7 +165,8 @@ def main() -> None:
         ]
         if post_event(event, payload):
             result = permission_decision(
-                wait_for_hardware_action(request_id)
+                wait_for_hardware_action(request_id),
+                payload,
             )
         else:
             result = permission_decision(None)

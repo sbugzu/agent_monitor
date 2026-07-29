@@ -135,11 +135,12 @@ GET /api/v1/action?request_id=request-42
 GET /api/v1/action?request_id=request-42&consume=true
 ```
 
-Claude Code 的现有 hooks 仍是观察型。Codex 的 `PermissionRequest` hook
-会等待硬件选择：`Allow Once` 和 `Reject` 分别返回 Codex 官方的 `allow`
-与 `deny` 决策；`Return` 只关闭硬件菜单并保留待确认请求，再次短按可重新
-进入。Codex 当前 hook 返回协议不支持持久化 Always Allow，因此硬件上的
-Codex 菜单不会提供该选项。Antigravity 的 `run_command` `PreToolUse` hook
+Claude Code 和 Codex 的 `PermissionRequest` hook 都会等待硬件选择：
+`Allow Once` 和 `Reject` 分别返回官方的 `allow` 与 `deny` 决策；`Return`
+只关闭硬件菜单并保留待确认请求，再次短按可重新进入。Claude Code 提供
+`permission_suggestions` 时还会显示 `Always Allow`，并原样应用 Claude
+建议的权限更新。Codex 当前 hook 返回协议不支持持久化 Always Allow，
+因此硬件上的 Codex 菜单不会提供该选项。Antigravity 的 `run_command` `PreToolUse` hook
 同样提供 `Reject` 与 `Allow Once`，选择后分别返回 `deny` 与 `allow`；
 超时或硬件离线时返回 `ask`，回退到 Antigravity 原生确认框。
 
@@ -165,7 +166,10 @@ Antigravity 要求 `PreToolUse` 返回权限决定；本 hook 最多等待硬件
 300 秒，`Allow Once` 返回 `allow`，`Reject` 返回 `deny`。当前 hook 协议
 没有持久化 Always Allow 的硬件决定，因此不显示该选项；超时或硬件离线时
 返回 `ask`，交回 Antigravity 原生确认界面。`Return` 只关闭硬件菜单，
-不会提交决定。Antigravity 手动停止时若未发送 `Stop` hook，Host 会在最后
+不会提交决定。当 `run_command` 明确请求 `BypassSandbox` 时，硬件上的
+`Allow Once` 还会返回仅匹配当前命令的 `unsandboxed(...)`
+`permissionOverrides`，避免 Antigravity App 对同一操作再次弹出沙箱确认，
+同时不会创建永久或通配授权。Antigravity 手动停止时若未发送 `Stop` hook，Host 会在最后
 一个 `PostToolUse` 或 `PostInvocation` 事件静默 5 秒后将状态收敛为完成。运行
 Antigravity 前请先启动 Host。安装或更新 hooks 后需要重启 Antigravity，
 并新建一个任务以重新加载配置：
@@ -184,8 +188,16 @@ http://127.0.0.1:8765/api/v1/hooks/claude
 ```
 
 Host 支持 `UserPromptSubmit`、`PreToolUse`、`PermissionRequest`、
-`PostToolUseFailure`、`StopFailure` 和 `Stop`。HTTP hook 使用空的 2xx
-响应，不会改变 Claude 的工具调用、权限或停止决策。
+`PermissionDenied`、`PostToolUse`、`PostToolUseFailure`、`StopFailure`
+和 `Stop`。普通生命周期事件使用空的
+2xx 响应，仅用于观察；`PermissionRequest` 最多等待硬件选择 300 秒，
+并用 Claude Code 官方的 JSON 响应协议批准或拒绝。硬件离线或超时会返回
+空响应，把决定交回 Claude 原生权限对话框。Claude Code 用户主动中断时
+不会发送 `Stop` hook；Host 会从该会话 transcript 的新增记录中识别官方
+中断标记，并在下一次进程监控轮询时清除残留的 `THINKING` 状态。
+当用户改在 Claude App 内批准时，后续 `PostToolUse` 会关闭硬件待审批菜单；
+Claude 的 `PermissionRequest` 不含 `tool_use_id`，Host 会用同一工具调用的
+`PreToolUse` 事件恢复关联，避免与并行工具事件混淆。
 
 Claude 的 API 地址和鉴权信息仅保留在用户级 Claude 配置中；Agent
 Monitor 不读取、复制或保存这些凭据。

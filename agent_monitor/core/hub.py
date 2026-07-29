@@ -42,6 +42,7 @@ class AgentMonitorHub:
         )
         self._interaction_sequence = 0
         self._interaction_lock = threading.RLock()
+        self._interaction_changed = threading.Condition(self._interaction_lock)
 
         # Pre-register standard adapters
         self.register_adapter(ClaudeCodeAdapter())
@@ -59,6 +60,7 @@ class AgentMonitorHub:
             if self.hardware_connections.get(transport) == connected:
                 return
             self.hardware_connections[transport] = connected
+            self._interaction_changed.notify_all()
         logger.info(
             "Hardware transport %s: %s",
             transport,
@@ -104,6 +106,7 @@ class AgentMonitorHub:
                 changed = True
                 if adapter.current_state != AgentState.WAITING_APPROVAL:
                     self.pending_interactions.pop(agent_id, None)
+                    self._interaction_changed.notify_all()
                 logger.info(
                     "Reconciled external task state for %s: %s",
                     agent_id,
@@ -294,6 +297,57 @@ class AgentMonitorHub:
             request_id,
         )
 
+    def _expire_interaction_locked(
+        self,
+        interaction: Dict[str, Any],
+    ) -> None:
+        agent_id = interaction["agent_id"]
+        request_id = interaction["request_id"]
+        session_id = interaction.get("session_id", "")
+        if self.pending_interactions.get(agent_id) is interaction:
+            self.pending_interactions.pop(agent_id, None)
+        lifecycle = self._approval_lifecycle(
+            agent_id,
+            session_id,
+            request_id,
+        )
+        if lifecycle:
+            lifecycle["phase"] = "timed_out"
+            lifecycle["timed_out_at"] = time.time()
+        adapter = self.adapters.get(agent_id)
+        if adapter:
+            adapter.mark_approval_phase(
+                session_id,
+                request_id,
+                "awaiting_input",
+                "Approval timed out · awaiting input",
+            )
+        self._interaction_changed.notify_all()
+        logger.info(
+            "Approval #%s timed out for %s session=%s request=%s",
+            interaction["sequence"],
+            agent_id,
+            session_id or "-",
+            request_id,
+        )
+
+    def expire_interaction(self, request_id: str) -> bool:
+        """Close an approval request whose blocking agent hook has timed out."""
+        with self._interaction_lock:
+            interaction = next(
+                (
+                    candidate
+                    for candidate in self.pending_interactions.values()
+                    if candidate["request_id"] == request_id
+                ),
+                None,
+            )
+            if not interaction:
+                return False
+            self._expire_interaction_locked(interaction)
+        self.notify_hardware()
+        return True
+
     def _active_interaction(self) -> Optional[Dict[str, Any]]:
         if not self.active_agent_id:
             return None
@@ -303,12 +357,11 @@ class AgentMonitorHub:
         adapter = self.adapters.get(self.active_agent_id)
         visible_session_id = adapter.visible_session_id if adapter else None
         interaction_session_id = interaction.get("session_id")
-        if (
-            not adapter
-            or adapter.current_state != AgentState.WAITING_APPROVAL
-            or interaction["expires_at"] <= time.time()
-        ):
+        if not adapter or adapter.current_state != AgentState.WAITING_APPROVAL:
             self.pending_interactions.pop(self.active_agent_id, None)
+            return None
+        if interaction["expires_at"] <= time.time():
+            self._expire_interaction_locked(interaction)
             return None
         if (
             visible_session_id
@@ -367,6 +420,7 @@ class AgentMonitorHub:
                 "message": interaction["message"],
             }
             self.action_results[request_id] = result
+            self._interaction_changed.notify_all()
             while len(self.action_results) > self.MAX_ACTION_RESULTS:
                 self.action_results.pop(next(iter(self.action_results)))
             self.pending_interactions.pop(interaction["agent_id"], None)
@@ -453,6 +507,33 @@ class AgentMonitorHub:
             self.notify_hardware()
         return copied
 
+    def wait_for_action_result(
+        self,
+        request_id: str,
+        timeout: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Wait for and consume one hardware decision from a blocking hook."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._interaction_changed:
+            while request_id not in self.action_results:
+                if not any(
+                    interaction["request_id"] == request_id
+                    for interaction in self.pending_interactions.values()
+                ):
+                    break
+                if not any(self.hardware_connections.values()):
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._interaction_changed.wait(remaining)
+
+        result = self.get_action_result(request_id, consume=True)
+        if result:
+            return result
+        self.expire_interaction(request_id)
+        return None
+
     def dispatch_event(self, agent_id: str, event_name: str, payload: Dict[str, Any], display_name: Optional[str] = None):
         if agent_id not in self.adapters and (
             event_name.lower() in ("start", "exit", "waiting_input")
@@ -471,7 +552,7 @@ class AgentMonitorHub:
                 adapter,
                 event,
             ):
-                return
+                return None
 
             result = adapter.apply_event(event)
             self.interaction_coordinator.sync_result(
@@ -488,8 +569,17 @@ class AgentMonitorHub:
             # active. IDLE adapters remain registered internally but stay hidden.
             if adapter.current_state != AgentState.IDLE:
                 self.active_agent_id = agent_id
+            self._interaction_changed.notify_all()
+            interaction = self.pending_interactions.get(agent_id)
+            request_id = (
+                interaction["request_id"]
+                if interaction
+                and interaction.get("session_id") == event.session_id
+                else None
+            )
 
         self.notify_hardware()
+        return request_id
 
     def get_hardware_payload(self) -> Dict[str, Any]:
         """Generates hardware display frame dictionary."""

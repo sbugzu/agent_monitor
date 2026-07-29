@@ -8,6 +8,7 @@ import json
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 import tempfile
+import threading
 from unittest.mock import patch
 from agent_monitor.core.states import AgentState
 from agent_monitor.adapters.claude_code import ClaudeCodeAdapter
@@ -73,6 +74,216 @@ class TestAdapters(unittest.TestCase):
         })
         self.assertEqual(adapter.current_state, AgentState.ERROR)
         self.assertFalse(adapter.unread)
+
+    def test_claude_user_interrupt_reconciles_without_stop_hook(self):
+        adapter = ClaudeCodeAdapter()
+        with tempfile.TemporaryDirectory() as directory:
+            transcript = Path(directory) / "claude.jsonl"
+            transcript.write_text(
+                json.dumps({
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": "Start work",
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+            adapter.handle_event("UserPromptSubmit", {
+                "session_id": "claude-task",
+                "transcript_path": str(transcript),
+                "prompt": "Start work",
+            })
+            with transcript.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "thinking", "thinking": "..."}],
+                    },
+                }) + "\n")
+                stream.write(json.dumps({
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": "[Request interrupted by user]",
+                        }],
+                    },
+                }) + "\n")
+
+            self.assertTrue(adapter.reconcile_external_state())
+
+        self.assertEqual(adapter.current_state, AgentState.IDLE)
+        self.assertEqual(adapter.last_message, "Claude task interrupted")
+        self.assertEqual(adapter.session_states, {})
+
+    def test_claude_old_interrupt_does_not_cancel_new_prompt(self):
+        adapter = ClaudeCodeAdapter()
+        with tempfile.TemporaryDirectory() as directory:
+            transcript = Path(directory) / "claude.jsonl"
+            transcript.write_text(
+                json.dumps({
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": "[Request interrupted by user]",
+                        }],
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+            adapter.handle_event("UserPromptSubmit", {
+                "session_id": "claude-task",
+                "transcript_path": str(transcript),
+                "prompt": "Try again",
+            })
+
+            self.assertFalse(adapter.reconcile_external_state())
+
+        self.assertEqual(adapter.current_state, AgentState.THINKING)
+
+    def test_claude_interrupt_removes_only_matching_parallel_session(self):
+        adapter = ClaudeCodeAdapter()
+        with tempfile.TemporaryDirectory() as directory:
+            paths = {}
+            for session_id in ("interrupted", "running"):
+                transcript = Path(directory) / f"{session_id}.jsonl"
+                transcript.write_text("", encoding="utf-8")
+                paths[session_id] = transcript
+                adapter.handle_event("UserPromptSubmit", {
+                    "session_id": session_id,
+                    "transcript_path": str(transcript),
+                    "prompt": session_id,
+                })
+
+            with paths["interrupted"].open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": "[Request interrupted by user for tool use]",
+                        }],
+                    },
+                }) + "\n")
+
+            self.assertTrue(adapter.reconcile_external_state())
+
+        self.assertNotIn("interrupted", adapter.session_states)
+        self.assertIn("running", adapter.session_states)
+        self.assertEqual(adapter.current_state, AgentState.THINKING)
+
+    def test_claude_interrupt_releases_blocking_permission_hook(self):
+        hub = AgentMonitorHub()
+        hub.set_hardware_connection("serial", True)
+        with tempfile.TemporaryDirectory() as directory:
+            transcript = Path(directory) / "claude.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            request_id = hub.dispatch_event(
+                "claude_code",
+                "PermissionRequest",
+                {
+                    "session_id": "claude-task",
+                    "transcript_path": str(transcript),
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "npm test"},
+                },
+            )
+            result = {}
+            waiter = threading.Thread(
+                target=lambda: result.setdefault(
+                    "action",
+                    hub.wait_for_action_result(request_id, timeout=5),
+                )
+            )
+            waiter.start()
+            with transcript.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": "[Request interrupted by user]",
+                        }],
+                    },
+                }) + "\n")
+
+            self.assertTrue(hub.reconcile_external_states())
+            waiter.join(timeout=1)
+
+        self.assertFalse(waiter.is_alive())
+        self.assertIsNone(result["action"])
+        self.assertNotIn("claude_code", hub.pending_interactions)
+        self.assertEqual(
+            hub.adapters["claude_code"].current_state,
+            AgentState.IDLE,
+        )
+
+    def test_claude_app_approval_posttool_closes_hardware_wait(self):
+        hub = AgentMonitorHub()
+        tool_payload = {
+            "session_id": "claude-task",
+            "tool_use_id": "tool-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+        }
+        hub.dispatch_event("claude_code", "PreToolUse", tool_payload)
+        request_id = hub.dispatch_event(
+            "claude_code",
+            "PermissionRequest",
+            {
+                key: value
+                for key, value in tool_payload.items()
+                if key != "tool_use_id"
+            },
+        )
+
+        self.assertEqual(request_id, "tool-1")
+        self.assertEqual(
+            hub.get_hardware_payload()["active"]["state"],
+            "WAITING_APPROVAL",
+        )
+
+        hub.dispatch_event("claude_code", "PostToolUse", tool_payload)
+
+        payload = hub.get_hardware_payload()
+        self.assertEqual(payload["active"]["state"], "THINKING")
+        self.assertEqual(payload["active"]["phase"], "working")
+        self.assertNotIn("interaction", payload)
+        self.assertEqual(
+            hub.approval_lifecycles[
+                ("claude_code", "claude-task", "tool-1")
+            ]["phase"],
+            "completed",
+        )
+
+    def test_claude_permission_denial_correlates_without_tool_use_id(self):
+        adapter = ClaudeCodeAdapter()
+        tool_payload = {
+            "session_id": "claude-task",
+            "tool_use_id": "tool-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+        }
+        adapter.translate_event("PreToolUse", tool_payload)
+
+        denied = adapter.translate_event(
+            "PermissionDenied",
+            {
+                key: value
+                for key, value in tool_payload.items()
+                if key != "tool_use_id"
+            },
+        )
+
+        self.assertEqual(denied.request_id, "tool-1")
+        self.assertEqual(denied.state, AgentState.ERROR)
 
     def test_codex_adapter(self):
         adapter = CodexAdapter()
@@ -164,6 +375,21 @@ class TestAdapters(unittest.TestCase):
         self.assertEqual(action, "allow_once")
         fetch.assert_called_once()
 
+    def test_codex_hook_expires_request_after_timeout(self):
+        with (
+            patch.object(CODEX_HOOK, "APPROVAL_TIMEOUT", 0),
+            patch.object(
+                CODEX_HOOK,
+                "fetch_hardware_action",
+                return_value=None,
+            ),
+            patch.object(CODEX_HOOK, "expire_hardware_request") as expire,
+        ):
+            action = CODEX_HOOK.wait_for_hardware_action("timeout-request")
+
+        self.assertIsNone(action)
+        expire.assert_called_once_with("timeout-request")
+
     def test_codex_hook_returns_immediately_when_hardware_is_offline(self):
         with (
             patch.object(
@@ -179,6 +405,43 @@ class TestAdapters(unittest.TestCase):
         fetch.assert_called_once()
         sleep.assert_not_called()
 
+    def test_hardware_approve_after_timeout_is_rejected_and_status_converges(self):
+        hub = AgentMonitorHub()
+        hub.dispatch_event("codex", "PermissionRequest", {
+            "session_id": "timed-out-task",
+            "tool_use_id": "timed-out-approval",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+        })
+        interaction = hub.pending_interactions["codex"]
+
+        with patch(
+            "agent_monitor.core.hub.time.time",
+            return_value=interaction["expires_at"],
+        ):
+            self.assertFalse(
+                hub.perform_active_action(
+                    "timed-out-approval",
+                    "allow_once",
+                )
+            )
+            payload = hub.get_hardware_payload()
+
+        self.assertNotIn("interaction", payload)
+        self.assertEqual(payload["active"]["state"], "WAITING_APPROVAL")
+        self.assertEqual(payload["active"]["phase"], "awaiting_input")
+        self.assertEqual(
+            payload["active"]["message"],
+            "Approval timed out · awaiting input",
+        )
+        self.assertNotIn("timed-out-approval", hub.action_results)
+        self.assertEqual(
+            hub.approval_lifecycles[
+                ("codex", "timed-out-task", "timed-out-approval")
+            ]["phase"],
+            "timed_out",
+        )
+
     def test_hardware_connection_status_uses_any_online_transport(self):
         hub = AgentMonitorHub()
         self.assertFalse(hub.is_hardware_connected())
@@ -190,6 +453,30 @@ class TestAdapters(unittest.TestCase):
 
         hub.set_hardware_connection("serial", False)
         self.assertFalse(hub.is_hardware_connected())
+
+    def test_blocking_hook_consumes_preselected_hardware_action(self):
+        hub = AgentMonitorHub()
+        request_id = hub.dispatch_event(
+            "claude_code",
+            "PermissionRequest",
+            {
+                "session_id": "claude-task",
+                "tool_name": "Bash",
+                "tool_input": {"command": "npm test"},
+            },
+        )
+        self.assertTrue(
+            hub.perform_active_action(request_id, "allow_once")
+        )
+
+        result = hub.wait_for_action_result(request_id, timeout=0)
+
+        self.assertEqual(result["action_id"], "allow_once")
+        self.assertNotIn(request_id, hub.action_results)
+        self.assertEqual(
+            hub.get_hardware_payload()["active"]["phase"],
+            "approved_running",
+        )
 
     def test_codex_new_tool_use_replaces_waiting_interaction(self):
         hub = AgentMonitorHub()
@@ -661,6 +948,60 @@ class TestAdapters(unittest.TestCase):
             "ask",
         )
 
+    def test_antigravity_hardware_allow_overrides_exact_sandbox_escape(self):
+        payload = {
+            "toolCall": {
+                "name": "run_command",
+                "args": {
+                    "BypassSandbox": True,
+                    "CommandLine": "git push -u origin main",
+                },
+            },
+        }
+
+        decision = ANTIGRAVITY_HOOK.permission_decision(
+            "allow_once",
+            payload,
+        )
+
+        self.assertEqual(decision["decision"], "allow")
+        self.assertEqual(
+            decision["permissionOverrides"],
+            ["unsandboxed(git push -u origin main)"],
+        )
+
+    def test_antigravity_sandbox_override_is_never_broader_than_request(self):
+        regular = ANTIGRAVITY_HOOK.permission_decision(
+            "allow_once",
+            {
+                "toolCall": {
+                    "args": {
+                        "BypassSandbox": False,
+                        "CommandLine": "git status",
+                    },
+                },
+            },
+        )
+        rejected = ANTIGRAVITY_HOOK.permission_decision(
+            "reject",
+            {
+                "toolCall": {
+                    "args": {
+                        "BypassSandbox": True,
+                        "CommandLine": "git push",
+                    },
+                },
+            },
+        )
+        missing_command = ANTIGRAVITY_HOOK.permission_decision(
+            "allow_once",
+            {"toolCall": {"args": {"BypassSandbox": True}}},
+        )
+
+        self.assertNotIn("permissionOverrides", regular)
+        self.assertNotIn("permissionOverrides", rejected)
+        self.assertNotIn("permissionOverrides", missing_command)
+
     def test_antigravity_hook_waits_for_and_returns_hardware_decision(self):
         posted = {}
 
@@ -711,6 +1052,47 @@ class TestAdapters(unittest.TestCase):
         )
         wait.assert_called_once_with(request_id)
         self.assertEqual(json.loads(stdout.getvalue())["decision"], "allow")
+
+    def test_antigravity_hook_emits_sandbox_override_after_hardware_allow(self):
+        stdout = io.StringIO()
+        with (
+            patch.object(
+                ANTIGRAVITY_HOOK.sys,
+                "argv",
+                ["antigravity-hook", "PreToolUse"],
+            ),
+            patch.object(
+                ANTIGRAVITY_HOOK.sys,
+                "stdin",
+                io.StringIO(json.dumps({
+                    "conversationId": "conversation-1",
+                    "toolCall": {
+                        "name": "run_command",
+                        "args": {
+                            "BypassSandbox": True,
+                            "CommandLine": ["git", "push"],
+                        },
+                    },
+                })),
+            ),
+            patch.object(ANTIGRAVITY_HOOK.sys, "stdout", stdout),
+            patch.object(
+                ANTIGRAVITY_HOOK,
+                "post_event",
+                return_value=True,
+            ),
+            patch.object(
+                ANTIGRAVITY_HOOK,
+                "wait_for_hardware_action",
+                return_value="allow_once",
+            ),
+        ):
+            ANTIGRAVITY_HOOK.main()
+
+        self.assertEqual(
+            json.loads(stdout.getvalue())["permissionOverrides"],
+            ["unsandboxed(git push)"],
+        )
 
     def test_antigravity_hook_returns_immediately_when_hardware_is_offline(self):
         with (
