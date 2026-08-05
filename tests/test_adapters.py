@@ -9,6 +9,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 import tempfile
 import threading
+from types import SimpleNamespace
 from unittest.mock import patch
 from agent_monitor.core.states import AgentState
 from agent_monitor.adapters.claude_code import ClaudeCodeAdapter
@@ -263,6 +264,30 @@ class TestAdapters(unittest.TestCase):
             "completed",
         )
 
+    def test_claude_permission_request_uses_pretool_id_not_turn_id(self):
+        hub = AgentMonitorHub()
+        tool_payload = {
+            "session_id": "claude-task",
+            "turn_id": "one-turn",
+            "tool_use_id": "tool-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+        }
+        hub.dispatch_event("claude_code", "PreToolUse", tool_payload)
+
+        request_id = hub.dispatch_event(
+            "claude_code",
+            "PermissionRequest",
+            {
+                key: value
+                for key, value in tool_payload.items()
+                if key != "tool_use_id"
+            },
+        )
+
+        self.assertEqual(request_id, "tool-1")
+        self.assertNotEqual(request_id, "one-turn")
+
     def test_claude_cancelled_hook_marks_app_approval_as_running(self):
         hub = AgentMonitorHub()
         hub.set_hardware_connection("serial", True)
@@ -441,6 +466,42 @@ class TestAdapters(unittest.TestCase):
             CODEX_HOOK.main()
 
         resolve.assert_called_once_with("tool-1")
+
+    def test_codex_hook_generates_request_id_when_tool_id_is_missing(self):
+        posted = {}
+        stdout = io.StringIO()
+        payload = {
+            "hook_event_name": "PermissionRequest",
+            "session_id": "codex-task",
+            "turn_id": "one-turn-with-several-commands",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+        }
+
+        def capture_event(event):
+            posted.update(event)
+            return True
+
+        with (
+            patch.object(CODEX_HOOK.sys, "stdout", stdout),
+            patch.object(CODEX_HOOK, "post_event", side_effect=capture_event),
+            patch.object(CODEX_HOOK, "install_cancellation_handler"),
+            patch.object(
+                CODEX_HOOK,
+                "wait_for_hardware_action",
+                return_value="allow_once",
+            ) as wait,
+            patch.object(
+                CODEX_HOOK.uuid,
+                "uuid4",
+                return_value=SimpleNamespace(hex="unique-permission"),
+            ),
+            patch.object(CODEX_HOOK.json, "load", return_value=payload),
+        ):
+            CODEX_HOOK.main()
+
+        self.assertEqual(posted["monitor_request_id"], "codex-unique-permission")
+        wait.assert_called_once_with("codex-unique-permission")
 
     def test_codex_hook_uses_five_minute_approval_window(self):
         self.assertEqual(CODEX_HOOK.APPROVAL_TIMEOUT, 300)
@@ -664,7 +725,7 @@ class TestAdapters(unittest.TestCase):
         )
         self.assertEqual(hub.get_hardware_payload()["agents_count"], 0)
 
-    def test_codex_task_complete_without_stop_becomes_awaiting(self):
+    def test_codex_task_complete_without_stop_becomes_completed(self):
         hub = AgentMonitorHub()
         with tempfile.TemporaryDirectory() as directory:
             transcript = Path(directory) / "rollout.jsonl"
@@ -689,11 +750,46 @@ class TestAdapters(unittest.TestCase):
             self.assertFalse(hub.reconcile_external_states())
 
         payload = hub.get_hardware_payload()
-        self.assertEqual(payload["active"]["state"], "WAITING_APPROVAL")
-        self.assertEqual(payload["active"]["message"], "Codex awaiting input")
-        self.assertEqual(payload["active"]["phase"], "awaiting_input")
-        self.assertEqual(payload["active"]["color"], "#FFB454")
+        self.assertEqual(payload["active"]["state"], "COMPLETED_UNREAD")
+        self.assertEqual(payload["active"]["message"], "Codex task finished")
+        self.assertEqual(payload["active"]["phase"], "")
+        self.assertEqual(payload["active"]["color"], "#BDE3C3")
         self.assertNotIn("interaction", payload)
+
+    def test_codex_task_complete_clears_stale_ble_approval(self):
+        hub = AgentMonitorHub()
+        with tempfile.TemporaryDirectory() as directory:
+            transcript = Path(directory) / "rollout.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            hub.dispatch_event("codex", "PermissionRequest", {
+                "session_id": "finished-task",
+                "turn_id": "finished-turn",
+                "tool_use_id": "late-approval",
+                "transcript_path": str(transcript),
+                "tool_name": "Bash",
+                "tool_input": {"command": "node --test"},
+            })
+            with transcript.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": "finished-turn",
+                    },
+                }) + "\n")
+
+            self.assertTrue(hub.reconcile_external_states())
+
+        payload = hub.get_hardware_payload()
+        self.assertEqual(payload["active"]["state"], "COMPLETED_UNREAD")
+        self.assertNotIn("interaction", payload)
+        self.assertFalse(
+            hub.perform_active_action("late-approval", "allow_once")
+        )
+        self.assertEqual(
+            hub.get_hardware_payload()["active"]["state"],
+            "COMPLETED_UNREAD",
+        )
 
     def test_codex_approval_tracks_selected_consumed_and_new_request(self):
         hub = AgentMonitorHub()
@@ -759,7 +855,7 @@ class TestAdapters(unittest.TestCase):
             "working",
         )
 
-    def test_codex_actionable_approval_outranks_display_only_awaiting(self):
+    def test_codex_actionable_approval_outranks_completed_turn(self):
         hub = AgentMonitorHub()
         with tempfile.TemporaryDirectory() as directory:
             transcript = Path(directory) / "rollout.jsonl"
@@ -814,6 +910,27 @@ class TestAdapters(unittest.TestCase):
         })
 
         self.assertNotIn("interaction", hub.get_hardware_payload())
+
+    def test_codex_turn_id_is_not_reused_for_distinct_permission_requests(self):
+        hub = AgentMonitorHub()
+        first = {
+            "session_id": "retry-session",
+            "turn_id": "retry-turn",
+            "monitor_request_id": "permission-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+        }
+        second = {**first, "monitor_request_id": "permission-2"}
+        hub.dispatch_event("codex", "PermissionRequest", first)
+        self.assertTrue(hub.perform_active_action("permission-1", "allow_once"))
+        hub.get_action_result("permission-1", consume=True, retain=True)
+
+        hub.dispatch_event("codex", "PermissionRequest", second)
+        self.assertEqual(
+            hub.get_hardware_payload()["interaction"]["request_id"],
+            "permission-2",
+        )
+        self.assertTrue(hub.perform_active_action("permission-2", "allow_once"))
 
     def test_codex_abort_removes_only_matching_parallel_session(self):
         hub = AgentMonitorHub()

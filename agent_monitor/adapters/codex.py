@@ -103,15 +103,15 @@ class CodexAdapter(SessionAwareAgentAdapter):
                 event == "task_complete"
                 and item.get("terminal_event") != "task_complete"
             ):
-                # Codex App labels a completed turn as awaiting the next user
-                # response, but currently does not always emit a Stop hook.
-                # This is a display-only wait and must not create an approval
-                # action menu.
-                item["state"] = AgentState.WAITING_APPROVAL
-                item["message"] = "Codex awaiting input"
+                # task_complete is terminal even when Codex App omits Stop.
+                # Treating the next-chat prompt as WAITING_APPROVAL leaves the
+                # hardware amber after all work has finished and can preserve
+                # the visual appearance of a stale permission request.
+                item["state"] = AgentState.COMPLETED_UNREAD
+                item["message"] = "Codex task finished"
                 item["updated_at"] = time.time()
                 item["interactive"] = False
-                item["phase"] = "awaiting_input"
+                item["phase"] = ""
                 item["terminal_event"] = "task_complete"
                 changed = True
 

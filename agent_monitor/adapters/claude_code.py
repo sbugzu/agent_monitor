@@ -5,6 +5,7 @@ Handles Claude Code lifecycle events (Prompt sent, Thinking/Tool call, Waiting c
 
 import json
 import os
+import uuid
 from typing import Dict, Any
 from agent_monitor.adapters.base import (
     NormalizedAgentEvent,
@@ -158,7 +159,19 @@ class ClaudeCodeAdapter(SessionAwareAgentAdapter):
         # Claude Code native hooks use names such as UserPromptSubmit and
         # PermissionRequest plus snake_case payload fields.
         event = normalize_event_name(event_name)
-        request_id = extract_request_id(payload)
+        # A Claude turn can include multiple permission prompts. Do not use
+        # turn_id as their identity: PermissionRequest omits tool_use_id, so
+        # recover the preceding PreToolUse id by tool signature instead.
+        request_id = str(
+            payload.get("monitor_request_id")
+            or payload.get("request_id")
+            or payload.get("requestId")
+            or payload.get("tool_use_id")
+            or payload.get("toolUseId")
+            or ""
+        )
+        if event == "pretooluse" and not request_id:
+            request_id = f"claude-{uuid.uuid4().hex}"
         if event == "pretooluse" and request_id:
             self._tool_request_ids[self._tool_signature(payload)] = request_id
             while len(self._tool_request_ids) > 100:
@@ -171,6 +184,10 @@ class ClaudeCodeAdapter(SessionAwareAgentAdapter):
                 self._tool_signature(payload),
                 "",
             )
+            if event == "permissionrequest" and not request_id:
+                # If the matching PreToolUse was unavailable, keep this menu
+                # independent from other requests in the same turn.
+                request_id = f"claude-{uuid.uuid4().hex}"
         command = extract_tool_command(payload)
         msg = (
             command

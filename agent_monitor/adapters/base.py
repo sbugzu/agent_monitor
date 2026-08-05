@@ -62,7 +62,10 @@ def extract_session_id(payload: Dict[str, Any]) -> str:
 
 def extract_request_id(payload: Dict[str, Any]) -> str:
     """Extract a stable approval/tool identity from common hook payloads."""
-    for key in ("request_id", "requestId", "tool_use_id", "toolUseId", "turn_id", "turnId"):
+    for key in (
+        "monitor_request_id", "request_id", "requestId", "tool_use_id",
+        "toolUseId", "turn_id", "turnId",
+    ):
         value = payload.get(key)
         if value is not None and str(value):
             return str(value)

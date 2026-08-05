@@ -9,6 +9,7 @@ import time
 import urllib.request
 import urllib.error
 import urllib.parse
+import uuid
 
 
 HOST_URL = os.environ.get(
@@ -167,15 +168,19 @@ def main() -> None:
             {"id": "reject", "label": "Reject"},
             {"id": "allow_once", "label": "Allow Once"},
         ]
+        # turn_id identifies the whole Codex turn, not one permission prompt.
+        # A turn may issue several commands, so it cannot be used as the
+        # hardware approval key when Codex omits tool_use_id.
+        payload["monitor_request_id"] = str(
+            payload.get("tool_use_id")
+            or payload.get("toolUseId")
+            or f"codex-{uuid.uuid4().hex}"
+        )
 
     if not post_event(payload) or event != "permissionrequest":
         return
 
-    request_id = str(
-        payload.get("tool_use_id")
-        or payload.get("turn_id")
-        or ""
-    )
+    request_id = str(payload.get("monitor_request_id") or "")
     if not request_id:
         return
 
